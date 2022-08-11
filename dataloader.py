@@ -16,6 +16,87 @@ from PIL import Image
 
 libbpg_path = "/home/mapl119/libbpg/" # Put your libbpg path here
 
+
+class VimeoDataset(torchData):
+    """ vimeo_septuplet dataset
+        download: `$ wget http://data.csail.mit.edu/tofu/dataset/vimeo_septuplet.zip`
+
+    Args:
+        root
+        mode
+        frames
+        transform
+    """
+
+    def __init__(self, root, frames=7, transform=rgb_transform):
+        super().__init__()
+        self.folder = glob(os.path.join(root, 'sequences/*/*/'))
+        self.frames = frames
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.folder)
+
+    @property
+    def info(self):
+        gop = self[0]
+        return "\nGop size: {}".format(gop.shape)
+
+    def __getitem__(self, index):
+        path = self.folder[index]
+        seed = random.randint(0, 1e9)
+        imgs = []
+        for f in range(self.frames):
+            random.seed(seed)
+            raw_path = os.path.join(path, 'im' + str(f + 1) + '.png')
+            imgs.append(self.transform(imgloader(raw_path)))
+
+        return stack(imgs)
+
+
+class VimeoDatasetBPGIframe(VimeoDataset):
+    """Video Dataset with BPG Iframe
+
+    Args:
+        root
+        qp
+        frames
+        transform
+    """
+
+    def __init__(self, root, qp, frames=7, transform=rgb_transform):
+        super().__init__(root, frames, transform)
+        self.qp = qp
+
+    def __getitem__(self, index):
+        path = self.folder[index]
+        seed = random.randint(0, 1e9)
+        imgs = []
+        for f in range(self.frames):
+            random.seed(seed)
+            raw_path = os.path.join(path, 'im' + str(f + 1) + '.png')
+
+            if f == 0:
+                img_root = path.replace('sequences', os.path.join('bpg', str(self.qp), 'decoded'))
+                os.makedirs(img_root, exist_ok=True)
+
+                img_path = os.path.join(img_root, f'frame_{frame_idx}.png')
+
+                if not os.path.exists(img_path):
+                    # Compress data on-the-fly when they are not previously compressed.
+                    bin_path = img_path.replace('decoded', 'bin').replace('png', 'bin')
+
+                    os.makedirs(os.path.dirname(bin_path), exist_ok=True)
+                    os.makedirs(os.path.dirname(img_path), exist_ok=True)
+
+                    subprocess.call(f'{libbpg_path}/bpgenc -f 444 -q {self.qp} -o {bin_path} {raw_path}'.split(' '))
+                    subprocess.call(f'{libbpg_path}/bpgdec -o {img_path} {bin_path}'.split(' '))
+
+            imgs.append(self.transform(imgloader(raw_path)))
+
+        return stack(imgs)
+
+
 class VideoTestSequence(torchData):
     def __init__(self, root, lmda, dataset='U', sequence='Beauty', seq_len=600, GOP=12):
         super(VideoTestSequence, self).__init__()
