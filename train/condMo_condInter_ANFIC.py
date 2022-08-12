@@ -152,14 +152,10 @@ class Pframe(CompressesModel):
             else:
                 frame_buffer = [self.frame_buffer[0], self.frame_buffer[0], self.frame_buffer[1]]
 
-            pred_frame, pred_flow = self.MWNet(frame_buffer,
-                                               self.flow_buffer if len(self.flow_buffer) == 2 else None, True)
+            pred_frame, pred_flow = self.MWNet(frame_buffer, self.flow_buffer if len(self.flow_buffer) == 2 else None, True)
 
             flow = self.MENet(ref_frame, coding_frame)
-            flow_hat, likelihood_m, pred_flow_hat, _, _, _ = self.CondMotion(flow, output=pred_flow, 
-                                                                             cond_coupling_input=pred_flow, 
-                                                                             pred_prior_input=pred_frame,
-                                                                             visual=visual, figname=visual_prefix+'_motion')
+            flow_hat, likelihood_m, pred_flow_hat, _ = self.CondMotion(flow, xc=pred_flow, x2_back=pred_flow, temporal_cond=pred_frame)
 
             self.MWNet.append_flow(flow_hat)
             
@@ -176,49 +172,6 @@ class Pframe(CompressesModel):
             flow_hat, likelihood_m = self.Motion(flow)
 
             self.MWNet.append_flow(flow_hat)
-            
-            mc_frame, warped_frame = self.motion_compensation(ref_frame, flow_hat)
-
-            likelihoods = likelihood_m
-            data = {'likelihood_m': likelihood_m, 'flow': flow, 'flow_hat': flow_hat, 'mc_frame': mc_frame, 'warped_frame': warped_frame}
-
-        return mc_frame, likelihoods, data
-
-    def motion_forward(self, ref_frame, coding_frame, visual=False, visual_prefix='', predict=False):
-
-        if predict:
-            assert len(self.frame_buffer) == 3 or len(self.frame_buffer) == 2
-
-            if len(self.frame_buffer) == 3:
-                frame_buffer = [self.frame_buffer[0], self.frame_buffer[1], self.frame_buffer[2]]
-
-            else:
-                frame_buffer = [self.frame_buffer[0], self.frame_buffer[0], self.frame_buffer[1]]
-
-            pred_frame, pred_flow = self.MWNet(frame_buffer,
-                                               self.flow_buffer if len(self.flow_buffer) == 2 else None, True)
-
-            flow = self.MENet(ref_frame, coding_frame)
-            flow_hat, likelihood_m, pred_flow_hat, _, _, _ = self.CondMotion(flow, output=pred_flow, 
-                                                                             cond_coupling_input=pred_flow, 
-                                                                             pred_prior_input=pred_frame,
-                                                                             visual=visual, figname=visual_prefix+'_motion')
-
-            self.MWNet.append_flow(flow_hat.detach())
-            
-            mc_frame, warped_frame = self.motion_compensation(ref_frame, flow_hat)
-
-            likelihoods = likelihood_m
-            data = {'likelihood_m': likelihood_m, 
-                    'flow': flow, 'flow_hat': flow_hat, 'mc_frame': mc_frame, 
-                    'pred_frame': pred_frame, 'pred_flow': pred_flow, 
-                    'pred_flow_hat': pred_flow_hat, 'warped_frame': warped_frame}
-
-        else:
-            flow = self.MENet(ref_frame, coding_frame)
-            flow_hat, likelihood_m = self.Motion(flow)
-
-            self.MWNet.append_flow(flow_hat.detach())
             
             mc_frame, warped_frame = self.motion_compensation(ref_frame, flow_hat)
 
@@ -230,8 +183,7 @@ class Pframe(CompressesModel):
     def forward(self, ref_frame, coding_frame, visual=False, visual_prefix='', predict=False):
         mc, likelihood_m, m_info = self.motion_forward(ref_frame, coding_frame, visual=visual, visual_prefix=visual_prefix, predict=predict)
 
-        reconstructed, likelihood_r, mc_hat, _, _, BDQ = self.Residual(coding_frame, output=mc, cond_coupling_input=mc,
-                                                                       visual=visual, figname=visual_prefix)
+        reconstructed, likelihood_r, mc_hat, BDQ = self.Residual(coding_frame, xc=mc_frame, x2_back=mc_frame, temporal_cond=mc_frame)
 
         likelihoods = likelihood_m + likelihood_r
         
@@ -243,7 +195,8 @@ class Pframe(CompressesModel):
             self.frame_buffer.pop(0)
             assert len(self.frame_buffer) == 3, str(len(self.frame_buffer))
 
-        return_info = m_info.update({'rec_frame': reconstructed,  'likelihoods': likelihoods, 'BDQ': BDQ, 'mc_hat' mc_hat})
+        return_info = m_info.update({'rec_frame': reconstructed,  'likelihoods': likelihoods, 'mc_hat' mc_hat, 'BDQ': BDQ})
+
         return return_info
 
     def training_step(self, batch, batch_idx):
@@ -564,8 +517,7 @@ class Pframe(CompressesModel):
         dataset_name, seq_name, batch, frame_id_start = batch
         frame_id = int(frame_id_start)
 
-        ref_frame = batch[:, 0]
-        batch = batch[:, 1:]
+        ref_frame, batch = batch[:, 0], batch[:, 1:]
         seq_name = seq_name[0]
         dataset_name = dataset_name[0]
 
