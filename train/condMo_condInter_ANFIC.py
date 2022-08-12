@@ -45,19 +45,6 @@ phase = {'trainMV': 15,
          'train_aux': 100}
 
 
-# Custom pytorch-lightning trainer ; provide feature that configuring trainer.current_epoch
-class CompressesModelTrainer(Trainer):
-    def __init__(self, **kwargs):
-        super(CompressesModelTrainer, self).__init__(**kwargs)
-
-    @property
-    def current_epoch(self) -> int:
-        return self.fit_loop.current_epoch
-
-    @current_epoch.setter
-    def current_epoch(self, value):
-        self.fit_loop.current_epoch = value
-
 class CompressesModel(LightningModule):
     """Basic Compress Model"""
 
@@ -90,15 +77,17 @@ class CompressesModel(LightningModule):
 
         return torch.stack(aux_loss).mean()
 
+
 class Pframe(CompressesModel):
     def __init__(self, args, mo_coder, cond_mo_coder, res_coder):
         super(Pframe, self).__init__()
         self.args = args
         self.criterion = nn.MSELoss(reduction='none') if not self.args.ssim else MS_SSIM(data_range=1.).cuda()
 
-        self.if_model = AugmentedNormalizedFlowHyperPriorCoder(128, 320, 192, num_layers=2, use_DQ=True, use_code=False,
-                                                               use_context=True, condition='GaussianMixtureModel', quant_mode='RUN')
-        if self.args.MENet == 'PWC':
+        self.if_model = AugmentedNormalizedFlowHyperPriorCoder(128, 320, 192, num_layers=2, use_QE=True, use_affine=False,
+                                                              use_context=True, condition='GaussianMixtureModel', quant_mode='RUN')
+
+        if self.args.MENet == 'PWC'
             self.MENet = PWCNet(trainable=False)
         elif self.args.MENet == 'SPy':
             self.MENet = SPyNet(trainable=False)
@@ -114,8 +103,7 @@ class Pframe(CompressesModel):
         if self.args.MCNet == 'UNet':
             self.MCNet = Refinement(6, 64, out_channels=3)
         elif self.args.MCNet == 'GridNet':
-            self.feature_extractors = nn.ModuleList([ResidualBlock(3, 32), DownsampleBlock(32, 64), DownsampleBlock(64, 96)])
-            self.MCNet = GridNet([6, 64, 128, 192], [32, 64, 96], 6, 3)
+            self.MCNet = nn.ModuleList([ResidualBlock(3, 32), DownsampleBlock(32, 64), DownsampleBlock(64, 96), GridNet([6, 64, 128, 192], [32, 64, 96], 6, 3)])
 
         self.Residual = res_coder
         self.frame_buffer = list()
@@ -132,13 +120,13 @@ class Pframe(CompressesModel):
         elif self.args.MCNet == 'GridNet':
             feats1 = [warped_frame]
             feats2 = [ref_frame]
-            for i, feature_extractor in enumerate(self.feature_extractors):
+            for i, feature_extractor in enumerate(self.MCNet[:-1]):
                 feat = feature_extractor(feats2[i])
                 feats1.append(self.Resampler(feat, nn.functional.interpolate(flow, scale_factor=2**(-i), mode='bilinear', align_corners=True) * 2**(-i)))
                 feats2.append(feat)
 
             feats = [torch.cat([feat1, feat2], axis=1)  for feat1, feat2 in zip(feats1, feats2)]
-            mc_frame, _ = self.MCNet(feats)
+            mc_frame, _ = self.MCNet[-1](feats)
             
         return mc_frame, warped_frame
 
@@ -163,9 +151,8 @@ class Pframe(CompressesModel):
 
             likelihoods = likelihood_m
             data = {'likelihood_m': likelihood_m, 
-                    'flow': flow, 'flow_hat': flow_hat, 'mc_frame': mc_frame, 
-                    'pred_frame': pred_frame, 'pred_flow': pred_flow, 
-                    'pred_flow_hat': pred_flow_hat, 'warped_frame': warped_frame}
+                    'flow': flow, 'flow_hat': flow_hat, 'mc_frame': mc_frame, 'warped_frame': warped_frame, 
+                    'pred_frame': pred_frame, 'pred_flow': pred_flow, 'pred_flow_hat': pred_flow_hat}
 
         else:
             flow = self.MENet(ref_frame, coding_frame)
@@ -176,11 +163,15 @@ class Pframe(CompressesModel):
             mc_frame, warped_frame = self.motion_compensation(ref_frame, flow_hat)
 
             likelihoods = likelihood_m
-            data = {'likelihood_m': likelihood_m, 'flow': flow, 'flow_hat': flow_hat, 'mc_frame': mc_frame, 'warped_frame': warped_frame}
+            data = {'likelihood_m': likelihood_m, 
+                    'flow': flow, 'flow_hat': flow_hat, 'mc_frame': mc_frame, 'warped_frame': warped_frame}
 
         return mc_frame, likelihoods, data
 
     def forward(self, ref_frame, coding_frame, visual=False, visual_prefix='', predict=False):
+        if not predict: # For the first P-frame, put I-frame into frame_buffer
+            self.frame_buffer = [ref_frame]
+
         mc, likelihood_m, m_info = self.motion_forward(ref_frame, coding_frame, visual=visual, visual_prefix=visual_prefix, predict=predict)
 
         reconstructed, likelihood_r, mc_hat, BDQ = self.Residual(coding_frame, xc=mc_frame, x2_back=mc_frame, temporal_cond=mc_frame)
@@ -198,275 +189,71 @@ class Pframe(CompressesModel):
         return_info = m_info.update({'rec_frame': reconstructed,  'likelihoods': likelihoods, 'mc_hat' mc_hat, 'BDQ': BDQ})
 
         return return_info
+    
+    def disable_modules(self, modules):
+        for module in modules:
+            module.requires_grad_(False)
+            for param in module.parameters(): 
+               self.optimizers().state[param] = {} # remove all state (step, exp_avg, exp_avg_sg)
 
     def training_step(self, batch, batch_idx):
         epoch = self.current_epoch
-
         batch = batch.cuda()
-
-        ref_frame = batch[:, 0]
 
         # I-frame
         with torch.no_grad():
-            ref_frame, _, _, _, _, _ = self.if_model(ref_frame)
+            reconstructed, _, _ = self.if_model(batch[:, 0])
+        
+        # Determine which modules in P-frame codec are disabled
+        self.requires_grad_(True)
+        if epoch < phase['trainMC']:
+            self.disable_modules([self.MENet, self.MWNet])
+        elif epoch < phase['trainRes_2frames']:
+            self.disable_modules([self.MENet, self.MWNet, self.Motion, self.CondMotion, self.MCNet])
+        
+        #### Start training with a batch of sequences ####
 
-        if epoch < phase['trainMV']:
-            self.MWNet.requires_grad_(False)
-            # self.Motion.requires_grad_(False)
+        loss = torch.tensor(0., dtype=torch.float, device=reconstructed.device)
+        dist_list = rate_list = mc_error_list = pred_frame_error_list = []
+        self.MWNet.clear_buffer()
+        self.frame_buffer = []
 
-            _phase = 'MV'
-            coding_frame = batch[:, 1]
-            mc_frame, likelihood_m, data = self.motion_forward(ref_frame, coding_frame, predict=False)
-            mc_frame = data['warped_frame']
+        if epoch < phase['trainMC']:
+            for frame_idx in range(1, 3):
+                ref_frame, coding_frame = batch[: frame_idx-1], batch[:, frame_idx]
 
-            distortion = self.criterion(coding_frame, mc_frame)
-            rate = trc.estimate_bpp(likelihood_m, input=coding_frame)
+                info = self(ref_frame, coding_frame, predict=(frame_idx != 1))
 
-            loss = (self.args.lmda * distortion.mean() + rate.mean())
-
-            # One the other P-frame
-            self.frame_buffer = [batch[:, 0], batch[:, 1], batch[:, 2]]
-            self.flow_buffer = [
-                                data['flow_hat'],
-                                self.MENet(batch[:, 1], batch[:, 2]).detach()
-                               ]
-            
-            ref_frame = batch[:, 2]
-            coding_frame = batch[:, 3]
-
-            mc_frame_1, likelihood_m_1, data_1 = self.motion_forward(ref_frame, coding_frame, predict=True)
-
-            mc_frame_1 = data_1['warped_frame']
-
-            distortion_1 = self.criterion(coding_frame, mc_frame_1)
-            rate_1 = trc.estimate_bpp(likelihood_m_1, input=coding_frame)
-            pred_frame_hat = self.Resampler(ref_frame, data_1['pred_flow_hat'])
-            pred_frame_error_1 = nn.MSELoss(reduction='none')(data_1['pred_frame'], pred_frame_hat)
-
-            loss += (self.args.lmda * distortion_1.mean() + rate_1.mean() + 0.01 * self.args.lmda * pred_frame_error_1.mean())
-            
-            loss /= 2
-
-            logs = {'train/loss': loss.item(),
-                    'train/distortion': np.mean([distortion.mean().item(), distortion_1.mean().item()]),
-                    'train/rate': np.mean([rate.mean().item(), rate_1.mean().item()]),
-                    'train/pred_frame_error': pred_frame_error_1.mean().item()
-                   }
-
-        elif epoch < phase['trainMC']:
-            self.MENet.requires_grad_(False)
-            self.MWNet.requires_grad_(False)
-            self.Motion.requires_grad_(False)
-            self.CondMotion.requires_grad_(False)
-
-            _phase = 'MC'
-            if epoch >= phase['trainMC'] - 3:
-                self.Motion.requires_grad_(True)
-                self.CondMotion.requires_grad_(True)
-
-                # First P-frame
-                coding_frame = batch[:, 1]
-                mc_frame, likelihood_m, data = self.motion_forward(ref_frame, coding_frame, predict=False)
-
-                distortion = self.criterion(coding_frame, mc_frame)
-                rate = trc.estimate_bpp(likelihood_m, input=coding_frame)
-
-                loss = (self.args.lmda * distortion.mean() + rate.mean())
-
-                # One the other P-frame
-                self.frame_buffer = [batch[:, 0], batch[:, 1], batch[:, 2]]
-                self.flow_buffer = [
-                                    data['flow_hat'],
-                                    self.MENet(batch[:, 1], batch[:, 2]).detach()
-                                   ]
-                
-                ref_frame = batch[:, 2]
-                coding_frame = batch[:, 3]
-
-                mc_frame_1, likelihood_m_1, data_1 = self.motion_forward(ref_frame, coding_frame, predict=True)
-
-
-                distortion_1 = self.criterion(coding_frame, mc_frame_1)
-                rate_1 = trc.estimate_bpp(likelihood_m_1, input=coding_frame)
-
-                #pred_flow_error_1 = nn.MSELoss(reduction='none')(data_1['pred_flow'], data_1['pred_flow_hat'])
-                #loss += (self.args.lmda * distortion_1.mean() + rate_1.mean() + 0.01 * self.args.lmda * pred_flow_error_1.mean())
-                
-                pred_frame_hat = self.Resampler(ref_frame, data_1['pred_flow_hat'])
-                pred_frame_error_1 = nn.MSELoss(reduction='none')(data_1['pred_frame'], pred_frame_hat)
-
-                loss += (self.args.lmda * distortion_1.mean() + rate_1.mean() + 0.01 * self.args.lmda * pred_frame_error_1.mean())
-                loss /= 2
-
-                logs = {'train/loss': loss.item(),
-                        'train/distortion': np.mean([distortion.mean().item(), distortion_1.mean().item()]),
-                        'train/rate': np.mean([rate.mean().item(), rate_1.mean().item()]),
-                        'train/pred_frame_error': pred_frame_error_1.mean().item()
-                       }
-            else:
-                ref_frame = batch[:, 0]
-                coding_frame = batch[:, 1]
-                
-                flow = self.MENet(ref_frame, coding_frame)
-
-                mc_frame, warped_frame = self.motion_compensation(ref_frame, flow)
-
-                distortion = self.criterion(coding_frame, mc_frame)
-
-                loss = self.args.lmda * distortion.mean()
-                logs = {'train/loss': loss.item()}
-
-        elif epoch < phase['trainAll_2frames']:
-            self.MWNet.requires_grad_(False)
-            self.Motion.requires_grad_(True)
-            self.CondMotion.requires_grad_(True)
-
-            if epoch < phase['trainRes_2frames']:
-                _phase = 'RES'
-            else:
-                _phase = 'ALL'
-            # First P-frame
-            coding_frame = batch[:, 1]
-            if _phase == 'RES':  # Train res_coder only
-                with torch.no_grad():
-                    mc_frame, likelihood_m, data = self.motion_forward(ref_frame, coding_frame, predict=False)
-
-            else:
-                mc_frame, likelihood_m, data = self.motion_forward(ref_frame, coding_frame, predict=False)
-
-            rec_frame, likelihood_r, mc_hat, _, _, _ = self.Residual(coding_frame, cond_coupling_input=mc_frame,
-                                                                     output=mc_frame)
-
-            likelihoods = likelihood_m + likelihood_r
-
-            distortion = self.criterion(coding_frame, rec_frame)
-            rate = trc.estimate_bpp(likelihoods, input=coding_frame)
-            mc_error = nn.MSELoss(reduction='none')(mc_frame, mc_hat)
-
-            loss = self.args.lmda * distortion.mean() + rate.mean() + 0.01 * self.args.lmda * mc_error.mean()
-
-
-            # One the other P-frame
-            self.frame_buffer = [rec_frame, batch[:, 1], batch[:, 2]]
-            self.flow_buffer = [
-                                data['flow_hat'],
-                                self.MENet(batch[:, 1], batch[:, 2])
-                               ]
-            ref_frame = batch[:, 2]
-            coding_frame = batch[:, 3]
-
-            if _phase == 'RES':  # Train res_coder only
-                with torch.no_grad():
-                    mc_frame, likelihood_m, data = self.motion_forward(ref_frame, coding_frame, predict=True)
-
-            else:
-                mc_frame, likelihood_m, data = self.motion_forward(ref_frame, coding_frame, predict=True)
-
-            rec_frame, likelihood_r, mc_hat, _, _, _ = self.Residual(coding_frame, cond_coupling_input=mc_frame,
-                                                                     output=mc_frame)
-
-            likelihoods_1 = likelihood_m + likelihood_r
-
-            distortion_1 = self.criterion(coding_frame, rec_frame)
-            rate_1 = trc.estimate_bpp(likelihoods_1, input=coding_frame)
-            mc_error_1 = nn.MSELoss(reduction='none')(mc_frame, mc_hat)
-            #pred_flow_error_1 = nn.MSELoss(reduction='none')(data_1['pred_flow'], data_1['pred_flow_hat'])
-            #loss += self.args.lmda * distortion_1.mean() + rate_1.mean() + 0.01 * self.args.lmda * (mc_error_1.mean() + pred_flow_error_1.mean())
-            
-            pred_frame_hat = self.Resampler(ref_frame, data['pred_flow_hat'])
-            pred_frame_error_1 = nn.MSELoss(reduction='none')(data['pred_frame'], pred_frame_hat)
-
-            loss += self.args.lmda * distortion_1.mean() + rate_1.mean() + 0.01 * self.args.lmda * (mc_error_1.mean() + pred_frame_error_1.mean())
-            #loss /=2
-
-            logs = {
-                'train/loss': loss.item(),
-                'train/distortion': np.mean([distortion.mean().item(), distortion_1.mean().item()]),
-                'train/rate': np.mean([rate.mean().item(), rate_1.mean().item()]),
-                'train/PSNR': mse2psnr(np.mean([distortion.mean().item(), distortion_1.mean().item()])),
-                'train/mc_error': np.mean([mc_error.mean().item(), mc_error_1.mean().item()]),
-                'train/pred_frame_error': pred_frame_error_1.mean().item()
-            }
-
-        elif epoch < phase['train_aux']:
-            self.requires_grad_(True)
-            self.MENet.requires_grad_(False)
-            self.MWNet.requires_grad_(False)
-            if self.args.restore == 'finetune':
-                self.requires_grad_(True)
-            #if epoch == 30:
-            #    self.requires_grad_(False)
-            #    self.Residual.DQ.requires_grad_(True)
-            
-            reconstructed = ref_frame
-
-            loss = torch.tensor(0., dtype=torch.float, device=reconstructed.device)
-            dist_list = []
-            rate_list = []
-            mc_error_list = []
-            pred_frame_error_list = []
-            self.frame_buffer = []
-            frame_count = 0
-
-            self.MWNet.clear_buffer()
-
-            for frame_idx in range(1, 4):
-                frame_count += 1
-                ref_frame = reconstructed
-                
-                if epoch < phase['trainAll_fullgop']:
-                    ref_frame = ref_frame.detach()
-
-                coding_frame = batch[:, frame_idx]
-
-                if frame_idx == 1:
-                    self.frame_buffer = [ref_frame]
-                    mc, likelihood_m, _ = self.motion_forward(ref_frame, coding_frame, predict=False)
+                if epoch < phase['trainMV']:
+                    distortion = self.criterion(coding_frame, info['warped_frame'])
+                    if self.args.ssim:
+                        distortion = (1 - distortion)/64
                 else:
-                    mc, likelihood_m, data_1 = self.motion_forward(ref_frame, coding_frame, predict=True)
+                    distortion = self.criterion(coding_frame, info['mc_frame'])
+                    if self.args.ssim:
+                        distortion = (1 - distortion)/64
 
-                
-                reconstructed, likelihood_r, mc_hat, _, _, _ = self.Residual(coding_frame, cond_coupling_input=mc,
-                                                                             output=mc)
-
-                reconstructed = reconstructed.clamp(0, 1)
-                self.frame_buffer.append(reconstructed.detach())
-
-                likelihoods = likelihood_m + likelihood_r
-
-                distortion = self.criterion(coding_frame, reconstructed)
-
-                rate = trc.estimate_bpp(likelihoods, input=coding_frame)
-                if self.args.ssim:
-                    distortion = (1 - distortion)/64
-                    #mc_error = (1 - self.criterion(mc, mc_hat))/64
-                    mc_error = nn.MSELoss(reduction='none')(mc, mc_hat)
-                else:
-                    mc_error = nn.MSELoss(reduction='none')(mc, mc_hat)
+                rate = trc.estimate_bpp(info['likelihood_m'], input=coding_frame)
                 
                 if frame_idx == 1:
-                    loss += self.args.lmda * distortion.mean() + rate.mean()# + 0.01 * self.args.lmda * mc_error.mean()
+                    loss += self.args.lmda * distortion.mean() + rate.mean()
                 else:
-                    pred_frame_hat = self.Resampler(ref_frame, data_1['pred_flow_hat'])
-                    pred_frame_error = nn.MSELoss(reduction='none')(data_1['pred_frame'], pred_frame_hat)
+                    pred_frame_hat = self.Resampler(ref_frame, info['pred_flow_hat'])
+                    pred_frame_error = nn.MSELoss(reduction='none')(info['pred_frame'], pred_frame_hat)
+                    if self.args.ssim:
+                        pred_frame_error = (1 - pred_frame_error)/64
+                    loss += self.args.lmda * distortion.mean() + rate.mean() + 0.01 * self.args.lmda * pred_frame_error.mean()
 
-                    #loss += self.args.lmda * distortion.mean() + rate.mean() + 0.01 * self.args.lmda * (mc_error.mean() + pred_frame_error.mean())
-                    loss += self.args.lmda * distortion.mean() + rate.mean()# + 0.01 * self.args.lmda * mc_error.mean()
-
-                    pred_frame_error_list.append(pred_frame_error.mean())
-
-                if len(self.frame_buffer) == 4:
-                    self.frame_buffer.pop(0)
-                    assert len(self.frame_buffer) == 3, str(len(self.frame_buffer))
+                # Manually update buffer
+                self.frame_buffer[-1] = coding_frame
 
                 dist_list.append(distortion.mean())
                 rate_list.append(rate.mean())
-                mc_error_list.append(mc_error.mean())
+                pred_frame_error_list.append(pred_frame_error.mean())
 
             loss = loss / frame_count
             distortion = torch.mean(torch.tensor(dist_list))
             rate = torch.mean(torch.tensor(rate_list))
-            mc_error = torch.mean(torch.tensor(mc_error_list))
             pred_frame_error = torch.mean(torch.tensor(pred_frame_error_list))
 
             logs = {
@@ -474,24 +261,62 @@ class Pframe(CompressesModel):
                     'train/distortion': distortion.item(), 
                     'train/PSNR': mse2psnr(distortion.item()), 
                     'train/rate': rate.item(), 
-                    'train/mc_error': mc_error.item(),
-                    'train/pred_frame_error': pred_frame_error.item()
+                    'train/pred_frame_error': pred_frame_error.item(), 
                    }
 
+        else if epoch < phase['train_aux']:
+            for frame_idx in range(1, 7):
+                ref_frame, coding_frame = reconstructed, batch[:, frame_idx]
+                if epoch < phase['trainAll_fullgop']:
+                    ref_frame = ref_frame.detach()
+
+                info = self(ref_frame, coding_frame, predict=(frame_idx != 1))
+
+                distortion = self.criterion(coding_frame, info['rec_frame'])
+                rate = trc.estimate_bpp(info['likelihoods'], input=coding_frame)
+
+                if self.args.ssim:
+                    distortion = (1 - distortion)/64
+                    #mc_error = (1 - self.criterion(mc, mc_hat))/64
+                    mc_error = nn.MSELoss(reduction='none')(mc, mc_hat)
+                else:
+                    mc_error = nn.MSELoss(reduction='none')(mc, mc_hat)
+                
+                loss += self.args.lmda * distortion.mean() + rate.mean() + 0.01 * self.args.lmda * mc_error.mean()
+
+                dist_list.append(distortion.mean())
+                rate_list.append(rate.mean())
+                mc_error_list.append(mc_error.mean())
+
+                if epoch < phase['trainAll_2frames'] and frame_idx == 2:
+                    break
+
+            loss = loss / frame_idx
+            distortion = torch.mean(torch.tensor(dist_list))
+            rate = torch.mean(torch.tensor(rate_list))
+            mc_error = torch.mean(torch.tensor(mc_error_list))
+
+            logs = {
+                    'train/loss': loss.item(),
+                    'train/distortion': distortion.item(), 
+                    'train/PSNR': mse2psnr(distortion.item()), 
+                    'train/rate': rate.item(), 
+                    'train/mc_error': mc_error.item(),
+                   }
         else:
             loss = self.aux_loss()
             
             logs = {
                     'train/loss': loss.item(),
                    }
-        # if epoch <= phase['trainMC']:
-        #     auxloss = self.Motion.aux_loss()
-        # else:
-        #     auxloss = self.aux_loss()
-        #
-        # logs['train/aux_loss'] = auxloss.item()
-        #
-        # loss = loss + auxloss
+            # if epoch <= phase['trainMC']:
+            #     auxloss = self.Motion.aux_loss()
+            # else:
+            #     auxloss = self.aux_loss()
+            #
+            # logs['train/aux_loss'] = auxloss.item()
+            #
+            # loss = loss + auxloss
 
         self.log_dict(logs)
 
@@ -517,9 +342,7 @@ class Pframe(CompressesModel):
         dataset_name, seq_name, batch, frame_id_start = batch
         frame_id = int(frame_id_start)
 
-        ref_frame, batch = batch[:, 0], batch[:, 1:]
-        seq_name = seq_name[0]
-        dataset_name = dataset_name[0]
+        ref_frame, batch, seq_name, dataset_name = batch[:, 0], batch[:, 1:], seq_name[0], dataset_name[0]
 
         gop_size = batch.size(1)
 
@@ -536,25 +359,22 @@ class Pframe(CompressesModel):
         epoch = int(self.current_epoch)
 
         self.MWNet.clear_buffer()
+        self.frame_buffer = None
 
         for frame_idx in range(gop_size):
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
 
-                if frame_idx == 1:
-                    self.frame_buffer = [align.align(ref_frame)]
-                    self.flow_buffer = list()
-                
-                info = self(align.align(ref_frame), align.align(coding_frame), visual=False, predict=(frame_idx == 1))
+                info = self(align.align(ref_frame), align.align(coding_frame), visual=False, predict=(frame_idx != 1))
 
-                likelihoods = info['likelihoods']
+                likelihoods, likelihood_m = info['likelihoods'], info['likelihood_m']
                 rec_frame = align.resume(info['rec_frame']).clamp(0, 1)
                 mc_frame = align.resume(info['mc_frame']).clamp(0, 1)
                 mc_hat = align.resume(info['mc_hat']).clamp(0, 1)
                 BDQ = align.resume(info['BDQ']).clamp(0, 1)
 
                 rate = trc.estimate_bpp(likelihoods, input=ref_frame).mean().item()
-                m_rate = trc.estimate_bpp(likelihoods[:2], input=ref_frame).mean().item()
+                m_rate = trc.estimate_bpp(likelihood_m, input=ref_frame).mean().item()
 
                 if frame_idx <= 2:
                     mse = torch.mean((rec_frame - coding_frame).pow(2))
@@ -710,6 +530,17 @@ class Pframe(CompressesModel):
             TO_VISUALIZE = False and frame_id_start == 1 and frame_idx < 8 #and seq_name in ['BasketballDrive', 'Kimono1', 'HoneyBee', 'Jockey']
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
+
+                info = self(align.align(ref_frame), align.align(coding_frame), visual=False, predict=(frame_idx != 1))
+
+                likelihoods, likelihood_m = info['likelihoods'], info['likelihood_m']
+                rec_frame = align.resume(info['rec_frame']).clamp(0, 1)
+                mc_frame = align.resume(info['mc_frame']).clamp(0, 1)
+                mc_hat = align.resume(info['mc_hat']).clamp(0, 1)
+                BDQ = align.resume(info['BDQ']).clamp(0, 1)
+
+                rate = trc.estimate_bpp(likelihoods, input=ref_frame).mean().item()
+                m_rate = trc.estimate_bpp(likelihood_m, input=ref_frame).mean().item()
 
                 # reconstruced frame will be next ref_frame
                 if TO_VISUALIZE:
