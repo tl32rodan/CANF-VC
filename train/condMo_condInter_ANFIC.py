@@ -129,7 +129,7 @@ class Pframe(CompressesModel):
             
         return mc_frame, warped_frame
 
-    def motion_forward(self, ref_frame, coding_frame, visual=False, visual_prefix='', predict=False):
+    def motion_forward(self, ref_frame, coding_frame, predict=False):
         if predict:
             assert len(self.frame_buffer) == 3 or len(self.frame_buffer) == 2
 
@@ -166,11 +166,11 @@ class Pframe(CompressesModel):
 
         return mc_frame, likelihoods, data
 
-    def forward(self, ref_frame, coding_frame, visual=False, visual_prefix='', predict=False):
+    def forward(self, ref_frame, coding_frame, predict=False):
         if not predict: # For the first P-frame, put I-frame into frame_buffer
             self.frame_buffer = [ref_frame]
 
-        mc, likelihood_m, m_info = self.motion_forward(ref_frame, coding_frame, visual=visual, visual_prefix=visual_prefix, predict=predict)
+        mc, likelihood_m, m_info = self.motion_forward(ref_frame, coding_frame, predict=predict)
 
         reconstructed, likelihood_r, mc_hat, BDQ = self.Residual(coding_frame, xc=mc_frame, x2_back=mc_frame, temporal_cond=mc_frame)
 
@@ -362,7 +362,7 @@ class Pframe(CompressesModel):
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
 
-                info = self(align.align(ref_frame), align.align(coding_frame), visual=False, predict=(frame_idx != 1))
+                info = self(align.align(ref_frame), align.align(coding_frame), predict=(frame_idx != 1))
 
                 likelihoods, likelihood_m = info['likelihoods'], info['likelihood_m']
                 rec_frame = align.resume(info['rec_frame']).clamp(0, 1)
@@ -528,7 +528,7 @@ class Pframe(CompressesModel):
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
 
-                info = self(align.align(ref_frame), align.align(coding_frame), visual=False, predict=(frame_idx != 1))
+                info = self(align.align(ref_frame), align.align(coding_frame), predict=(frame_idx != 1))
 
                 likelihoods, likelihood_m = info['likelihoods'], info['likelihood_m']
                 rec_frame = align.resume(info['rec_frame']).clamp(0, 1)
