@@ -10,8 +10,7 @@ import torch.nn.functional as F
 
 from functools import partial
 from torchinfo import summary
-from pytorch_lightning import LightningModule
-from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CometLogger
 from torch import nn, optim
@@ -21,7 +20,7 @@ from torchvision.utils import make_grid
 
 from ..entropy_models import EntropyBottleneck
 from ..networks import AugmentedNormalizedFlowHyperPriorCoder, ResBlock
-from ..dataloader import VimeoDataset, VimeoDatasetBPGIframe, VideoTestSequence
+from ..dataloader import VimeoDataset, VimeoDatasetBPGIframe, VideoTestData
 from ..flownets import PWCNet, SPyNet
 from ..SDCNet import SDCNet_3M
 from ..GridNet import GridNet, ResidualBlock, DownsampleBlock
@@ -107,7 +106,7 @@ class Pframe(CompressesModel):
 
         self.Residual = res_coder
         self.frame_buffer = list()
-        self.flow_buffer = list()
+        # flow buffer will be handled in SDCNet
 
     def load_args(self, args):
         self.args = args
@@ -136,11 +135,10 @@ class Pframe(CompressesModel):
 
             if len(self.frame_buffer) == 3:
                 frame_buffer = [self.frame_buffer[0], self.frame_buffer[1], self.frame_buffer[2]]
-
             else:
                 frame_buffer = [self.frame_buffer[0], self.frame_buffer[0], self.frame_buffer[1]]
 
-            pred_frame, pred_flow = self.MWNet(frame_buffer, self.flow_buffer if len(self.flow_buffer) == 2 else None, True)
+            pred_frame, pred_flow = self.MWNet(frame_buffer, None, True)
 
             flow = self.MENet(ref_frame, coding_frame)
             flow_hat, likelihood_m, pred_flow_hat, _ = self.CondMotion(flow, xc=pred_flow, x2_back=pred_flow, temporal_cond=pred_frame)
@@ -212,7 +210,6 @@ class Pframe(CompressesModel):
             self.disable_modules([self.MENet, self.MWNet, self.Motion, self.CondMotion, self.MCNet])
         
         #### Start training with a batch of sequences ####
-
         loss = torch.tensor(0., dtype=torch.float, device=reconstructed.device)
         dist_list = rate_list = mc_error_list = pred_frame_error_list = []
         self.MWNet.clear_buffer()
@@ -484,50 +481,50 @@ class Pframe(CompressesModel):
         return None
 
     def test_step(self, batch, batch_idx):
-        metrics_name = ['PSNR', 'Rate', 'Mo_Rate', 'MC-PSNR', 'MCrec-PSNR', 'MCerr-PSNR', 'BDQ-PSNR', 'QE-PSNR', 'back-PSNR', 'p1-PSNR', 'p1-BDQ-PSNR']
+        if self.args.msssim:
+            similarity_metrics = 'MS-SSIM'
+        else:
+            similarity_metrics = 'PSNR'
+        
+        metrics_name = [similarity_metrics, 'Rate', 'Mo_Rate', 'MC-PSNR', 'MCrec-PSNR', 'MCerr-PSNR', 'BDQ-PSNR', 'QE-PSNR', 'back-PSNR', 'p1-PSNR', 'p1-BDQ-PSNR']
         metrics = {}
         for m in metrics_name:
             metrics[m] = []
-        # PSNR: PSNR(gt, ADQ)
-        # Rate
-        # Mo_Rate: Motion Rate
-        # MC-PSNR: PSNR(gt, mc_frame)
-        # MCrec-PSNR: PSNR(gt, x_2)
-        # MCerr-PSNR: PSNR(x_2, mc_frame)
-        # BDQ-PSNR: PSNR(gt, BDQ)
-        # QE-PSNR: PSNR(BDQ, ADQ)
-        # back-PSNR: PSNR(mc_frame, BDQ)
-        # p1-PSNR: PSNR(gt, ADQ) only when first P-frame in a GOP
-        # p1-BDQ-PSNR: PSNR(gt, BDQ) only when first P-frame in a GOP
+
+        os.makedirs(self.args.save_dir + f'/{seq_name}/flow', exist_ok=True)
+        os.makedirs(self.args.save_dir + f'/{seq_name}/gt_frame', exist_ok=True)
+        os.makedirs(self.args.save_dir + f'/{seq_name}/mc_frame', exist_ok=True)
+        os.makedirs(self.args.save_dir + f'/{seq_name}/rec_frame', exist_ok=True)
+        os.makedirs(self.args.save_dir + f'/{seq_name}/pred_frame', exist_ok=True)
+        os.makedirs(self.args.save_dir + f'/{seq_name}/BDQ', exist_ok=True)
+        os.makedirs(self.args.save_dir + f'/{seq_name}/mc_hat', exist_ok=True)
+
 
         dataset_name, seq_name, batch, frame_id_start = batch
-        frame_id = int(frame_id_start)
 
-        ref_frame = batch[:, 0]  # Put reference frame in first position
-        batch = batch[:, 1:]  # GT
+        ref_frame = batch[:, 0] # BPG-compressed I-frame in position 0
+        batch = batch[:, 1:] # coding frames
         seq_name = seq_name[0]
         dataset_name = dataset_name[0]
 
         gop_size = batch.size(1)
 
         height, width = ref_frame.size()[2:]
-        estimate_bpp = partial(trc.estimate_bpp, num_pixels=height * width)
 
-        psnr_list = []
-        mc_psnr_list = []
-        mc_hat_psnr_list = []
-        BDQ_psnr_list = []
-        rate_list = []
-        m_rate_list = []
         log_list = []
 
-        align = trc.util.Alignment()
-
+        # To align frame into multiplications of 64 ; zero-padding is performed
+        align = Alignment().to(DEVICE)
+        
+        # Clear motion buffer & frame buffer
         self.MWNet.clear_buffer()
+        self.frame_buffer = list()
 
         for frame_idx in range(gop_size):
             ref_frame = ref_frame.clamp(0, 1)
-            TO_VISUALIZE = False and frame_id_start == 1 and frame_idx < 8 #and seq_name in ['BasketballDrive', 'Kimono1', 'HoneyBee', 'Jockey']
+            coding_frame = batch[:, frame_idx].to(DEVICE)
+
+            # P-frame
             if frame_idx != 0:
                 coding_frame = batch[:, frame_idx]
 
@@ -542,101 +539,41 @@ class Pframe(CompressesModel):
                 rate = trc.estimate_bpp(likelihoods, input=ref_frame).mean().item()
                 m_rate = trc.estimate_bpp(likelihood_m, input=ref_frame).mean().item()
 
-                # reconstruced frame will be next ref_frame
-                if TO_VISUALIZE:
-                    os.makedirs(os.path.join(self.args.save_dir, 'visualize_ANFIC', f'batch_{batch_idx}'), exist_ok=True)
-
-                if frame_idx == 1:
-                    self.frame_buffer = [align.align(ref_frame)]
-                    mc_frame, likelihood_m, data = self.motion_forward(align.align(ref_frame),
-                                                                       align.align(coding_frame), predict=False)
+                mse = self.criterion(rec_frame, coding_frame).mean().item()
+                if self.args.msssim:
+                    similarity = mse
                 else:
-                    mc_frame, likelihood_m, data = self.motion_forward(align.align(ref_frame),
-                                                                       align.align(coding_frame), predict=True)
+                    similarity = mse2psnr(mse)
 
-                rec_frame, likelihood_r, mc_hat, _, _, BDQ = self.Residual(align.align(coding_frame), output=mc_frame,
-                                                                           cond_coupling_input=mc_frame,
-                                                                           visual=TO_VISUALIZE, 
-                                                                           figname=os.path.join(
-                                                                                self.args.save_dir,
-                                                                                'visualize_ANFIC',
-                                                                                f'batch_{batch_idx}',
-                                                                                f'frame_{frame_idx}',
-                                                                           ))
+                metrics[similarity_metrics].append(similarity)
+                metrics['Rate'].append(rate)
+
+                # likelihoods[0] & [1] are motion latent & hyper likelihood
+                m_rate = estimate_bpp(likelihoods[0], input=coding_frame).mean().item() + \
+                         estimate_bpp(likelihoods[1], input=coding_frame).mean().item()
+                metrics['Mo_Rate'].append(m_rate)
+
                 
-                rec_frame = rec_frame.clamp(0, 1)
-                self.frame_buffer.append(rec_frame.detach())
-
-                if len(self.frame_buffer) == 4:
-                    self.frame_buffer.pop(0)
-                    assert len(self.frame_buffer) == 3, str(len(self.frame_buffer))
-
-                likelihoods = likelihood_m + likelihood_r
-
-                ref_frame = rec_frame.detach()
-                ref_frame = align.resume(ref_frame)
-                mc_frame = align.resume(mc_frame)
-                warped_frame = align.resume(data['warped_frame'])
-                coding_frame = align.resume(coding_frame)
-                mc_hat = align.resume(mc_hat)
-                BDQ = align.resume(BDQ)
-
-                os.makedirs(self.args.save_dir + f'/{seq_name}/flow', exist_ok=True)
-                os.makedirs(self.args.save_dir + f'/{seq_name}/gt_frame', exist_ok=True)
-                os.makedirs(self.args.save_dir + f'/{seq_name}/mc_frame', exist_ok=True)
-                os.makedirs(self.args.save_dir + f'/{seq_name}/rec_frame', exist_ok=True)
-                os.makedirs(self.args.save_dir + f'/{seq_name}/pred_frame', exist_ok=True)
-                os.makedirs(self.args.save_dir + f'/{seq_name}/BDQ', exist_ok=True)
-                os.makedirs(self.args.save_dir + f'/{seq_name}/mc_hat', exist_ok=True)
-
                 if TO_VISUALIZE:
                     flow_map = plot_flow(data['flow_hat'])
-                    save_image(flow_map,
-                               self.args.save_dir + f'/{seq_name}/flow/'
-                                                    f'frame_{int(frame_id_start + frame_idx)}_flow.png',
-                               nrow=1)
+                    save_image(flow_map,os.path.join(self.args.save_dir, f'{seq_name}/flow/', f'frame_{int(frame_id_start + frame_idx)}_flow.png'), nrow=1)
 
                     if frame_idx > 1:
                         flow_map = plot_flow(data['pred_flow'])
-                        save_image(flow_map,
-                                   self.args.save_dir + f'/{seq_name}/flow/'
-                                                        f'frame_{int(frame_id_start + frame_idx)}_flow_pred.png',
-                                   nrow=1)
+                        save_image(flow_map, os.path.join(self.args.save_dir, f'{seq_name}/flow/', f'frame_{int(frame_id_start + frame_idx)}_flow_pred.png'), nrow=1)
 
                         flow_map = plot_flow(data['pred_flow_hat'])
-                        save_image(flow_map,
-                                   self.args.save_dir + f'/{seq_name}/flow/'
-                                                        f'frame_{int(frame_id_start + frame_idx)}_flow_pred_hat.png',
-                                   nrow=1)
+                        save_image(flow_map, os.path.join(self.args.save_dir, f'{seq_name}/flow/', f'frame_{int(frame_id_start + frame_idx)}_flow_pred_hat.png'), nrow=1)
 
                         pred_frame = align.resume(data['pred_frame'])
-                        save_image(pred_frame, self.args.save_dir + f'/{seq_name}/pred_frame/'
-                                                                    f'frame_{int(frame_id_start + frame_idx)}.png')
+                        save_image(pred_frame, os.path.join(self.args.save_dir, f'{seq_name}/pred_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
 
-                    save_image(coding_frame[0], self.args.save_dir + f'/{seq_name}/gt_frame/'
-                                                                     f'frame_{int(frame_id_start + frame_idx)}.png')
-                    save_image(mc_frame[0], self.args.save_dir + f'/{seq_name}/mc_frame/'
-                                                                 f'frame_{int(frame_id_start + frame_idx)}.png')
-                    save_image(warped_frame[0], self.args.save_dir + f'/{seq_name}/mc_frame/'
-                                                                   f'frame_{int(frame_id_start + frame_idx)}_bmc.png')
-                    save_image(ref_frame[0], self.args.save_dir + f'/{seq_name}/rec_frame/'
-                                                                  f'frame_{int(frame_id_start + frame_idx)}.png')
-                    save_image(BDQ[0], self.args.save_dir + f'/{seq_name}/BDQ/'
-                                                            f'frame_{int(frame_id_start + frame_idx)}.png')
-                    save_image(mc_hat[0], self.args.save_dir + f'/{seq_name}/mc_hat/'
-                                                               f'frame_{int(frame_id_start + frame_idx)}.png')
-
-                rate = trc.estimate_bpp(likelihoods, input=ref_frame).mean().item()
-                mse = self.criterion(ref_frame, batch[:, frame_idx]).mean().item()
-                if self.args.ssim:
-                    psnr = mse
-                else:
-                    psnr = mse2psnr(mse)
-
-                # likelihoods[0] & [1] are motion latent & hyper likelihood
-                m_rate = trc.estimate_bpp(likelihoods[0], input=ref_frame).mean().item() + \
-                         trc.estimate_bpp(likelihoods[1], input=ref_frame).mean().item()
-                metrics['Mo_Rate'].append(m_rate)
+                    save_image(coding_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/gt_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
+                    save_image(mc_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/mc_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
+                    save_image(warped_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/mc_frame/', f'frame_{int(frame_id_start + frame_idx)}_warped.png'), nrow=1)
+                    save_image(rec_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/rec_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
+                    save_image(BDQ[0], os.path.join(self.args.save_dir, f'{seq_name}/BDQ/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
+                    save_image(mc_hat[0], os.path.join(self.args.save_dir, f'{seq_name}/mc_hat/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
 
                 mc_psnr = mse2psnr(self.criterion(warped_frame, coding_frame).mean().item())
                 metrics['MC-PSNR'].append(mc_psnr)
@@ -660,93 +597,41 @@ class Pframe(CompressesModel):
                     metrics['p1-PSNR'].append(psnr)
                     metrics['p1-BDQ-PSNR'].append(BDQ_psnr)
 
-                log_list.append({'PSNR': psnr, 'Rate': rate, 'MC-PSNR': mc_psnr,
+                log_list.append({similarity_metrics: similarity, 'Rate': rate, 'MC-PSNR': mc_psnr, 'Mo_Rate': m_rate,
                                  'my': estimate_bpp(likelihoods[0]).item(), 'mz': estimate_bpp(likelihoods[1]).item(),
                                  'ry': estimate_bpp(likelihoods[2]).item(), 'rz': estimate_bpp(likelihoods[3]).item(),
                                  'MCerr-PSNR': mc_err_psnr, 'BDQ-PSNR': BDQ_psnr})
+            
+            # I-frame
+            else:
+                rec_frame, likelihoods, _ = self.if_model(align.align(coding_frame))
+                rec_frame = align.resume(rec_frame.to(DEVICE)).clamp(0, 1)
+                rate = estimate_bpp(likelihoods, input=rec_frame).mean().item()
 
-            else: 
-                with torch.no_grad():
-                    rec_frame, likelihoods, _, _, _, _ = self.if_model(align.align(batch[:, frame_idx]))
-
-                rec_frame = align.resume(rec_frame).clamp(0, 1)
-                rate = trc.estimate_bpp(likelihoods, input=rec_frame).mean().item()
-
-                mse = self.criterion(rec_frame, batch[:, frame_idx]).mean().item()
-                if self.args.ssim:
-                    psnr = mse
+                if self.args.msssim:
+                    similarity = self.criterion(rec_frame, coding_frame).mean().item()
                 else:
-                    psnr = mse2psnr(mse)
+                    mse = self.criterion(rec_frame, coding_frame).mean().item()
+                    similarity = mse2psnr(mse)
 
-                ref_frame = rec_frame
-                # os.makedirs(self.args.save_dir + f'/{seq_name}/rec_frame', exist_ok=True)
-                # if TO_VISUALIZE:
-                #     save_image(rec_frame[0], self.args.save_dir + f'/{seq_name}/rec_frame/'
-                #                f'frame_{int(frame_id_start + frame_idx)}.png')
+                metrics[similarity_metrics].append(similarity)
+                metrics['Rate'].append(rate)
 
-                ## record rate and reconstructed frame of I frame coder
-                ## Note: need to change path for different I frame coder manually
-                if args.store_i:
-                    dataset_root = os.getenv('DATAROOT')
-                    i_frame = 'ANFIC' if not args.ssim else 'ANFIC_MSSSIM'
-                    os.makedirs(f'{dataset_root}/TestVideo/{i_frame}/{args.lmda}/decoded/{seq_name}', exist_ok=True)
-                    os.makedirs(f'{dataset_root}/TestVideo/{i_frame}/{args.lmda}/bin/{seq_name}', exist_ok=True)
-                    save_image(rec_frame[0], f'{dataset_root}/TestVideo/{i_frame}/{args.lmda}/decoded/{seq_name}/frame_{int(frame_id_start + frame_idx)}.png')
-                    with open(f'{dataset_root}/TestVideo/{i_frame}/{args.lmda}/bin/{seq_name}/frame_{int(frame_id_start + frame_idx)}.txt', 'w') as fp:
-                        fp.write(str(rate * height * width))
-                    with open(f'{dataset_root}/TestVideo/{i_frame}/{args.lmda}/decoded/{seq_name}/frame_{int(frame_id_start + frame_idx)}.txt', 'w') as fp:
-                        fp.write(str(psnr))
+                save_image(coding_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/gt_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
+                save_image(rec_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/rec_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
 
-                log_list.append({'PSNR': psnr, 'Rate': rate})
+                log_list.append({similarity_metrics: similarity, 'Rate': rate})
 
-            metrics['PSNR'].append(psnr)
-            metrics['Rate'].append(rate)
-
-            frame_id += 1
+            # Make reconstruction as next reference frame
+            ref_frame = rec_frame
 
         for m in metrics_name:
             metrics[m] = np.mean(metrics[m])
 
         logs = {'dataset_name': dataset_name, 'seq_name': seq_name, 'metrics': metrics, 'log_list': log_list,}
-
         return {'test_log': logs}
 
-
     def test_epoch_end(self, outputs):
-        # dataset_name = {'HEVC-B': ['BasketballDrive', 'BQTerrace', 'Cactus', 'Kimono1', 'ParkScene'],
-        #                 'UVG': ['Beauty', 'Bosphorus', 'HoneyBee', 'Jockey', 'ReadySteadyGo', 'ShakeNDry', 'YachtRide'],
-        #                 'HEVC-C': ['BasketballDrill', 'BQMall', 'PartyScene', 'RaceHorses'],
-        #                 'CLIC_2022': ['a06845dd7d1d808e4f4743b7f08f2bf75a9a72264d4fb16505caf6e334611003',
-        #                             '57cb54c2cde2789359ecf11b9b9b8207c6a79b7aa27f15a69d7e9a1c2caad912',
-        #                             'fae057c83b04868424da3bb7139e29b3f328d5a93aaa9e617e825b93422d92c5',
-        #                             'af31d741db80475c531bb7182ad0536df9dc88a6876fa38386dd5db850d86051',
-        #                             'd0a99fb6b64e60d7754265586481ec43968e8fd97e7e4437332bb182d7548cb3',
-        #                             '97d6ac9d81b64bf909bf4898072bb20492522ae182918e763a86b56745890add',
-        #                             'd73059fe0ed42169f7e98ff7401d00479a7969753eb80af9846176a42543ccb0',
-        #                             '23e266612abe7b8767587d6e77a5eb3c6b8a71c6bf4c4ff2b1c11cc478cc7244',
-        #                             '9a6379abea3fc820ca60afb9a60092d41b3a772ff348cfec92c062f6187f85e2',
-        #                             '7c7d58e4f82772f627d5cbe3df3b08573d5bd7a58639387b865449d5a550bbda',
-        #                             '29aabdd9d3065802c21e2d828561c205d563e79d39d1e10a18f961b5b5bf0cad',
-        #                             '7b0eaacc48c9b5ea0edf5dcf352d913fd0cf3f79ae149e94ada89ba1e772e711',
-        #                             '0442d8bdf9902226bfb38fbe039840d4f8ebe5270eda39d7dba56c2c3ae5becc',
-        #                             'b7ee0264612a6ca6bf2bfa03df68acf4af9bb5cac34f7ad43fe30fa4b7bc4824',
-        #                             '8db183688ce3e59461355e2c7cc97b3aee9f514a2e28260ead5a3ccf2000b079',
-        #                             '8cbafab285e74614f10d3a8bf9ee94434eacae6332f5f10fe1e50bfe5de9ec33',
-        #                             '318c694f5c83b78367da7e6584a95872510db8544f815120a86923aff00f5ff9',
-        #                             '04ca8d2ac3af26ad4c5b14cf214e0d7c317c953e804810829d41645fdce1ad88',
-        #                             '1e3224380c76fb4cad0a8d3a7c74a8d5bf0688d13df15f23acd2512de4374cb4',
-        #                             '04a1274a93ec6a36ad2c1cb5eb83c3bdf2cf05bbe01c70a8ca846a7f9fa4b550',
-        #                             '0d49152a92ce3b843968bf2e131ea5bc5e409ab056196e8c373f9bd2d31b303d',
-        #                             '5d8f03cf5c6a469004a0ca73948ad64fa6d222b3b807f155a66684387f5d208a',
-        #                             '0e1474478f33373566b4fbd6b357cf6b65015a6f4aa646754e065bf4a1b43c15',
-        #                             '0659b03fb82cae130fef6a931755bbaae6e7bd88f58873df1ae98d2145dba9ce',
-        #                             'a89f641b8dd2192f6f8b0ae75e3a24388b96023b21c63ff67bb359628f5df6de',
-        #                             '209921b14cef20d62002e2b0c21ad692226135b52fee7eead315039ca51c470c',
-        #                             '917d1b33f0e20d2d81471c3a0ff7adbef9e1fb7ee184b604880b280161ffdd56',
-        #                             '9ce4af9a3b304b4b5387f27bca137ce1f0f35c12837c753fc17ea9bb49eb8ec5',
-        #                             '393608bbbf2ac4d141ce6a3616a2364a2071539acb1969032012348c5817ef3c',
-        #                             '9299df423938da4fd7f51736070420d2bb39d33972729b46a16180d07262df12']
-        #                }
 
         metrics_name = list(outputs[0]['test_log']['metrics'].keys())  # Get all metrics' names
 
@@ -795,8 +680,6 @@ class Pframe(CompressesModel):
                 columns = ['frame'] + list(log_list[1].keys())
                 writer.writerow(columns)
 
-                # writer.writerow(['frame', 'PSNR', 'total bits', 'MC-PSNR', 'my', 'mz', 'ry', 'rz', 'MCerr-PSNR'])
-
                 for idx in range(len(log_list)):
                     writer.writerow([f'frame_{idx + 1}'] + list(log_list[idx].values()))
 
@@ -808,7 +691,7 @@ class Pframe(CompressesModel):
         print_log += '\n'
 
         for seq_name in single_seq_logs['Seq_Names']:
-            print_log += '{:>16} '.format(seq_name[:5])
+            print_log += '{:>16} '.format(seq_name)
 
             for metrics in metrics_name:
                 print_log += '{:12.4f}'.format(np.mean(single_seq_logs[metrics][seq_name]))
@@ -829,16 +712,12 @@ class Pframe(CompressesModel):
         with open(self.args.save_dir + f'/brief_summary.txt', 'w', newline='') as report:
             report.write(print_log)
 
-        self.log_dict(logs)
-
-        return None
-
-
     def configure_optimizers(self):
         # REQUIRED
         # can return multiple optimizers and learning_rate schedulers
         current_epoch = self.trainer.current_epoch
         
+        # Learning rate degrades when RNN-based training
         lr_step = []
         for k, v in phase.items():
             if 'RNN' in k and v > current_epoch: 
@@ -866,65 +745,23 @@ class Pframe(CompressesModel):
         optimizer.step()
         optimizer.zero_grad()
 
-    def compress(self, ref_frame, coding_frame, p_order):
-        flow = self.MENet(ref_frame, coding_frame)
-
-        flow_hat, mv_strings, mv_shape = self.Motion.compress(flow, return_hat=True, p_order=p_order)
-
-        strings, shapes = [mv_strings], [mv_shape]
-
-        mc_frame = self.mc_net_forward(ref_frame, flow_hat)
-
-        predicted = mc_frame
-
-        #res = coding_frame - predicted
-        reconstructed, res_strings, res_shape = self.Residual.compress(coding_frame, mc_frame, return_hat=True)
-        #reconstructed = predicted + res_hat
-        strings.append(res_strings)
-        shapes.append(res_shape)
-
-        return reconstructed, strings, shapes
-
-    def decompress(self, ref_frame, strings, shapes, p_order):
-        # TODO: Modify to make AR function work
-        mv_strings = strings[0]
-        mv_shape = shapes[0]
-
-        flow_hat = self.Motion.decompress(mv_strings, mv_shape, p_order=p_order)
-
-        mc_frame = self.mc_net_forward(ref_frame, flow_hat)
-
-        predicted = mc_frame
-        res_strings, res_shape = strings[1], shapes[1]
-
-        reconstructed = self.Residual.decompress(res_strings, res_shape)
-        #reconstructed = predicted + res_hat
-
-        return reconstructed
-
     def setup(self, stage):
         self.logger.experiment.log_parameters(self.args)
 
-        dataset_root = os.getenv('DATAROOT')
         qp = {256: 37, 512: 32, 1024: 27, 2048: 22, 4096: 22}[self.args.lmda]
 
         if stage == 'fit':
             transformer = transforms.Compose([
-                transforms.RandomCrop((256, 256)),
+                transforms.RandomCrop(self.args.patch_size),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor()
             ])
 
-            self.train_dataset = VideoDataIframe(dataset_root + "vimeo_septuplet/", 'BPG_QP' + str(qp), 7,
-                                                 transform=transformer)
-            self.val_dataset = VideoTestDataIframe(dataset_root, self.args.lmda, first_gop=True)
+            self.train_dataset = VimeoDataset(os.path.join(self.args.dataset_path, "vimeo_septuplet/"), qp, 7, transform=transformer)
+            self.val_dataset = VideoTestData(dataset_root, self.args.lmda, sequence=('B'), GOP=32)
 
         elif stage == 'test':
-            #self.test_dataset = VideoTestDataIframe(dataset_root, self.args.lmda, sequence=('U', 'B', 'M', 'C', 'D', 'E'))
-            #self.test_dataset = VideoTestDataIframe(dataset_root, self.args.lmda, sequence=('U', 'B', 'M'), first_gop=True)
-            #self.test_dataset = VideoTestDataIframe(dataset_root, self.args.lmda, sequence=('C', 'D', 'E'))
-            self.test_dataset = VideoTestDataIframe(dataset_root, self.args.lmda, sequence=('U', 'B', 'M', 'K'), GOP=self.args.test_GOP)
-            #self.test_dataset = VideoTestDataIframe(dataset_root, self.args.lmda, sequence=('U', 'B'), GOP=self.args.test_GOP)
+            self.test_dataset = VideoTestData(dataset_root, self.args.lmda, sequence=('U', 'B', 'M', 'K'), GOP=self.args.test_GOP)
 
         else:
             raise NotImplementedError
@@ -960,17 +797,19 @@ class Pframe(CompressesModel):
         """
         # MODEL specific
         parser = argparse.ArgumentParser(parents=[parent_parser], add_help=False)
+        parser.add_argument('--MENet', type=str, choices=['PWC', 'SPy'], default='PWC')
+        parser.add_argument('--MCNet', type=str, choices=['UNet', 'GridNet'], default='UNet')
         parser.add_argument('--learning_rate', '-lr', dest='lr', default=1e-4, type=float)
         parser.add_argument('--batch_size', default=16, type=int)
-        parser.add_argument('--lmda', default=2048, choices=[256, 512, 1024, 2048, 4096], type=int)
         parser.add_argument('--patch_size', default=256, type=int)
+        parser.add_argument('--lmda', default=2048, choices=[256, 512, 1024, 2048, 4096], type=int)
         parser.add_argument('--ssim', action="store_true")
         parser.add_argument('--debug', action="store_true")
 
         # training specific (for this model)
         parser.add_argument('--num_workers', default=16, type=int)
-        parser.add_argument('--save_dir')
-        parser.add_argument('--store_i', default=False, action='store_true')
+        parser.add_argument('--dataset_path', default='./video_dataset', type=str)
+        parser.add_argument('--log_path', default='./logs', type=str)
 
         return parser
 
@@ -978,9 +817,6 @@ if __name__ == '__main__':
     # sets seeds for numpy, torch, etc...
     # must do for DDP to work well
     seed_everything(888888)
-
-    #save_root = "/work/u4803414/torchDVC/"
-    save_root = os.getenv('LOG', './') + '/torchDVC/'
 
     parser = argparse.ArgumentParser(add_help=True)
 
@@ -991,29 +827,21 @@ if __name__ == '__main__':
     # good practice to define LightningModule speficic params in the module
     parser = Pframe.add_model_specific_args(parser)
 
-    #trc.add_coder_args(parser)
-
     # training specific
     parser.add_argument("--disable_signalconv", "-DS", action="store_true", help="Enable SignalConv or not.")
-    parser.add_argument("--deconv_type", "-DT", type=str, default="Signal", 
-                        choices=trc.__DECONV_TYPES__.keys(), help="Configure deconvolution type")
+    parser.add_argument("--deconv_type", "-DT", type=str, default="Signal", choices=trc.__DECONV_TYPES__.keys(), help="Configure deconvolution type")
 
     parser.add_argument('--restore', type=str, choices=['none', 'resume', 'load', 'custom', 'finetune'], default='none')
-    parser.add_argument('--restore_exp_key', type=str, default=None)
-    parser.add_argument('--restore_exp_epoch', type=int, default=49)
+    parser.add_argument('--restore_key', type=str, default=None)
+    parser.add_argument('--restore_epoch', type=int, default=49)
     parser.add_argument('--test', "-T", action="store_true")
     parser.add_argument('--test_GOP', type=int, default=32)
     parser.add_argument('--experiment_name', type=str, default='basic')
-    parser.add_argument('--project_name', type=str, default="CANFVC+")
+    parser.add_argument('--project_name', type=str, default="CANFVC")
 
-    parser.add_argument('--MENet', type=str, choices=['PWC', 'SPy'], default='PWC')
-    parser.add_argument('--MCNet', type=str, choices=['UNet', 'GridNet'], default='UNet')
     parser.add_argument('--motion_coder_conf', type=str, default=None)
     parser.add_argument('--cond_motion_coder_conf', type=str, default=None)
     parser.add_argument('--residual_coder_conf', type=str, default=None)
-    parser.add_argument('--prev_motion_coder_conf', type=str, default=None)
-    parser.add_argument('--prev_cond_motion_coder_conf', type=str, default=None)
-    parser.add_argument('--prev_residual_coder_conf', type=str, default=None)
 
     parser.set_defaults(gpus=1)
 
@@ -1081,15 +909,29 @@ if __name__ == '__main__':
         disabled=args.test or args.debug
     )
     
-    args.save_dir = os.path.join(save_root, project_name, experiment_name + '-' + str(args.lmda))
-
+    # args.save_dir will be created only when testing
+    args.save_dir = os.path.join(args.logs, project_name, experiment_name + '-' + str(args.lmda))
+    
+    ######## Restore usage:
+    #   *(default) 'none': Train P-frame codec from scratch. 
+    #                      Note that I-frame codec should be (and is) pre-loaded.
+    #   *'resume': Resume an existing experiment. 
+    #              No new experiments will be created in comet.ml. 
+    #   *'load': Load an existing experiment and creat a new experiment. 
+    #            Usually used when some intermediate phases should be conducted again.
+    #   *'custom': Customize a new experiment from one or multiple experiments. 
+    #              Usually used when you want to change architecture or load specific modules from several experiments.
+    #   *'finetune': Enable all modules in P-frame codec for fine-tuning.
+    #                Usually used for the very last step of codec training or fine-tuning for lower bit-rate models.
+    ########
+    
     if args.restore == 'resume' or args.restore == 'finetune':
         trainer = Trainer.from_argparse_args(args,
                                              checkpoint_callback=checkpoint_callback,
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=save_root,
+                                             default_root_dir=args.logs,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=0,
                                              terminate_on_nan=True)
@@ -1098,8 +940,7 @@ if __name__ == '__main__':
         if args.restore_exp_key is None:
             raise ValueError
         else:  # When prev_exp_key is specified in args
-            checkpoint = torch.load(os.path.join(save_root, project_name, args.restore_exp_key, "checkpoints",
-                                                 f"epoch={epoch_num}.ckpt"),
+            checkpoint = torch.load(os.path.join(args.logs, project_name, args.restore_exp_key, "checkpoints", f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
         
         if args.restore == 'resume':
@@ -1107,7 +948,7 @@ if __name__ == '__main__':
         else:
             trainer.current_epoch = phase['trainAll_2frames']
         
-        coder_ckpt = torch.load(os.path.join(os.getenv('LOG', './'), f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         for k, v in coder_ckpt.items():
@@ -1123,24 +964,22 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=save_root,
+                                             default_root_dir=args.logs,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=0,
                                              terminate_on_nan=True)
 
-        
         epoch_num = args.restore_exp_epoch
         if args.restore_exp_key is None:
             raise ValueError
         else:  # When prev_exp_key is specified in args
-            checkpoint = torch.load(os.path.join(save_root, project_name, args.restore_exp_key, "checkpoints",
+            checkpoint = torch.load(os.path.join(args.logs, project_name, args.restore_exp_key, "checkpoints",
                                                  f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
 
         #trainer.current_epoch = phase['trainAll_fullgop'] - 3
-        trainer.current_epoch = phase['train_aux'] 
 
-        coder_ckpt = torch.load(os.path.join(os.getenv('LOG', './'), f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         for k, v in coder_ckpt.items():
@@ -1157,43 +996,18 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=save_root,
+                                             default_root_dir=args.logs,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=-1,
                                              terminate_on_nan=True)
         
         epoch_num = args.restore_exp_epoch
-#         if args.restore_exp_key is None:
-#             raise ValueError
-#         else:  # When prev_exp_key is specified in args
-#             checkpoint = torch.load(os.path.join(save_root, project_name, args.restore_exp_key, "checkpoints",
-#                                                  f"epoch={epoch_num}.ckpt"),
-#                                     map_location=(lambda storage, loc: storage))
 
-        checkpoint = torch.load(os.path.join(save_root, "ANF-based-resCoder-for-DVC", "cf8be0b8102c4a6eb2015b58f184f757", "checkpoints",
-                                             "epoch=83.ckpt"),
+        checkpoint = torch.load(os.path.join(args.logs, "ANF-based-resCoder-for-DVC", "cf8be0b8102c4a6eb2015b58f184f757", "checkpoints", "epoch=83.ckpt"),
                                 map_location=(lambda storage, loc: storage))
         trainer.current_epoch = phase['trainMV']
-        # Previous coders
-        #assert not (args.prev_motion_coder_conf is None)
-        #prev_mo_coder_cfg = yaml.safe_load(open(args.prev_motion_coder_conf, 'r'))
-        #assert prev_mo_coder_cfg['model_architecture'] in trc.__CODER_TYPES__.keys()
-        #prev_mo_coder_arch = trc.__CODER_TYPES__[prev_mo_coder_cfg['model_architecture']]
-        #prev_mo_coder = prev_mo_coder_arch(**prev_mo_coder_cfg['model_params'])
-        #
-        #assert not (args.prev_cond_motion_coder_conf is None)
-        #prev_cond_mo_coder_cfg = yaml.safe_load(open(args.prev_cond_motion_coder_conf, 'r'))
-        #assert prev_cond_mo_coder_cfg['model_architecture'] in trc.__CODER_TYPES__.keys()
-        #prev_cond_mo_coder_arch = trc.__CODER_TYPES__[prev_cond_mo_coder_cfg['model_architecture']]
-        #prev_cond_mo_coder = prev_cond_mo_coder_arch(**prev_cond_mo_coder_cfg['model_params'])
-
-        #assert not (args.prev_residual_coder_conf is None)
-        #prev_res_coder_cfg = yaml.safe_load(open(args.prev_residual_coder_conf, 'r'))
-        #assert prev_res_coder_cfg['model_architecture'] in trc.__CODER_TYPES__.keys()
-        #prev_res_coder_arch = trc.__CODER_TYPES__[prev_res_coder_cfg['model_architecture']]
-        #prev_res_coder = prev_res_coder_arch(**prev_res_coder_cfg['model_params'])
    
-        gridnet_ckpt = torch.load(os.path.join(save_root, "CANFVC_Plus", "gridnet.pth"),
+        gridnet_ckpt = torch.load(os.path.join(args.logs, "CANFVC_Plus", "gridnet.pth"),
                                 map_location=(lambda storage, loc: storage))
         from collections import OrderedDict
         new_ckpt = OrderedDict()
@@ -1209,7 +1023,7 @@ if __name__ == '__main__':
                 key = '.'.join(['MCNet'] + k.split('.')[3:])
                 new_ckpt[key] = v
 
-        coder_ckpt = torch.load(os.path.join(os.getenv('LOG', './'), f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         for k, v in coder_ckpt.items():
@@ -1225,12 +1039,12 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=save_root,
+                                             default_root_dir=args.logs,
                                              check_val_every_n_epoch=3,
                                              num_sanity_val_steps=-1,
                                              terminate_on_nan=True)
     
-        coder_ckpt = torch.load(os.path.join(os.getenv('LOG', './'), f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         from collections import OrderedDict
