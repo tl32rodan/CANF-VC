@@ -805,6 +805,7 @@ class Pframe(CompressesModel):
         parser.add_argument('--lmda', default=2048, choices=[256, 512, 1024, 2048, 4096], type=int)
         parser.add_argument('--ssim', action="store_true")
         parser.add_argument('--debug', action="store_true")
+        parser.add_argument('--verbose', action="store_true")
 
         # training specific (for this model)
         parser.add_argument('--num_workers', default=16, type=int)
@@ -828,9 +829,6 @@ if __name__ == '__main__':
     parser = Pframe.add_model_specific_args(parser)
 
     # training specific
-    parser.add_argument("--disable_signalconv", "-DS", action="store_true", help="Enable SignalConv or not.")
-    parser.add_argument("--deconv_type", "-DT", type=str, default="Signal", choices=trc.__DECONV_TYPES__.keys(), help="Configure deconvolution type")
-
     parser.add_argument('--restore', type=str, choices=['none', 'resume', 'load', 'custom', 'finetune'], default='none')
     parser.add_argument('--restore_key', type=str, default=None)
     parser.add_argument('--restore_epoch', type=int, default=49)
@@ -977,7 +975,7 @@ if __name__ == '__main__':
                                                  f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
 
-        #trainer.current_epoch = phase['trainAll_fullgop'] - 3
+        trainer.current_epoch = epoch_num + 1
 
         coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
@@ -1056,6 +1054,9 @@ if __name__ == '__main__':
 
         model = Pframe(args, mo_coder, cond_mo_coder, res_coder).cuda()
         model.load_state_dict(new_ckpt, strict=False)
+
+    if args.verbose:
+        summary(model)
 
     if args.test:
         trainer.test(model)
