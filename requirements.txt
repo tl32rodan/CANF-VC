@@ -15,3 +15,6 @@ pandas==0.24.2
 pytorch-msssim==0.1.5
 tqdm==4.61.2
 higher==0.2.1
+comet-ml==3.13.2
+flowiz==2.4.0
+torchinfo==1.5.3

@@ -7,6 +7,7 @@ import flowiz as fz
 import numpy as np
 import torch
 import torch.nn.functional as F
+import sys
 
 from functools import partial
 from torchinfo import summary
@@ -86,7 +87,7 @@ class Pframe(CompressesModel):
         self.if_model = AugmentedNormalizedFlowHyperPriorCoder(128, 320, 192, num_layers=2, use_QE=True, use_affine=False,
                                                               use_context=True, condition='GaussianMixtureModel', quant_mode='RUN')
 
-        if self.args.MENet == 'PWC'
+        if self.args.MENet == 'PWC':
             self.MENet = PWCNet(trainable=False)
         elif self.args.MENet == 'SPy':
             self.MENet = SPyNet(trainable=False)
@@ -184,7 +185,7 @@ class Pframe(CompressesModel):
             self.frame_buffer.pop(0)
             assert len(self.frame_buffer) == 3, str(len(self.frame_buffer))
 
-        return_info = m_info.update({'rec_frame': reconstructed,  'likelihoods': likelihoods, 'mc_hat' mc_hat, 'BDQ': BDQ})
+        return_info = m_info.update({'rec_frame': reconstructed,  'likelihoods': likelihoods, 'mc_hat': mc_hat, 'BDQ': BDQ})
 
         return return_info
     
@@ -261,7 +262,7 @@ class Pframe(CompressesModel):
                     'train/pred_frame_error': pred_frame_error.item(), 
                    }
 
-        else if epoch < phase['train_aux']:
+        elif epoch < phase['train_aux']:
             for frame_idx in range(1, 7):
                 ref_frame, coding_frame = reconstructed, batch[:, frame_idx]
                 if epoch < phase['trainAll_fullgop']:
