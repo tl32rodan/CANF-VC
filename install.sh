@@ -1,3 +1,3 @@
-cd CANF_VC/
+cd CANF_VC
 bash install.sh
-cd ..
+cd ../
