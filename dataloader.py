@@ -14,7 +14,7 @@ from subprocess import Popen, PIPE
 from CANF_VC.util.vision import imgloader, rgb_transform
 from PIL import Image
 
-libbpg_path = "/home/mapl119/libbpg/" # Put your libbpg path here
+libbpg_path = os.getenv('BPG') # Put your libbpg path here
 
 
 class VimeoDataset(torchData):

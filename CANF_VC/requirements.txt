@@ -18,3 +18,4 @@ higher==0.2.1
 comet-ml==3.13.2
 flowiz==2.4.0
 torchinfo==1.5.3
+ptflops==0.6.8

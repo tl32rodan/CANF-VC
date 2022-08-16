@@ -15,8 +15,8 @@ import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
-video_root = './video_dataset'
-dataset = 'D' # 'U', 'B', 'C', 'D', 'E', 'M'
+video_root = '/dataset/video_dataset'
+dataset = 'B' # 'U', 'B', 'C', 'D', 'E', 'M'
 
 video_name_list = {
     'U': ['Beauty', 'Bosphorus', 'HoneyBee', 'Jockey', 'ReadySteadyGo', 'ShakeNDry', 'YachtRide'],

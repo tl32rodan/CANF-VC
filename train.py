@@ -18,20 +18,19 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import make_grid
-
-from ..entropy_models import EntropyBottleneck
-from ..networks import AugmentedNormalizedFlowHyperPriorCoder, ResBlock
-from ..dataloader import VimeoDataset, VimeoDatasetBPGIframe, VideoTestData
-from ..flownets import PWCNet, SPyNet
-from ..SDCNet import SDCNet_3M
-from ..GridNet import GridNet, ResidualBlock, DownsampleBlock
-from ..models import Refinement
-from ..util.psnr import mse2psnr
-from ..util.sampler import Resampler
-from ..util.ssim import MS_SSIM
-from ..util.vision import PlotFlow, PlotHeatMap, save_image
-
 from ptflops import get_model_complexity_info
+
+from dataloader import VimeoDataset, VimeoDatasetBPGIframe, VideoTestData
+from CANF_VC.entropy_models import EntropyBottleneck
+from CANF_VC.networks import __CODER_TYPES__, AugmentedNormalizedFlowHyperPriorCoder
+from CANF_VC.flownets import PWCNet, SPyNet
+from CANF_VC.SDCNet import MotionExtrapolationNet
+from CANF_VC.GridNet import GridNet, ResidualBlock, DownsampleBlock
+from CANF_VC.models import Refinement
+from CANF_VC.util.psnr import mse2psnr
+from CANF_VC.util.sampler import Resampler
+from CANF_VC.util.ssim import MS_SSIM
+from CANF_VC.util.vision import PlotFlow, PlotHeatMap, save_image
 
 plot_flow = PlotFlow().cuda() 
 
@@ -85,14 +84,14 @@ class Pframe(CompressesModel):
         self.criterion = nn.MSELoss(reduction='none') if not self.args.ssim else MS_SSIM(data_range=1.).cuda()
 
         self.if_model = AugmentedNormalizedFlowHyperPriorCoder(128, 320, 192, num_layers=2, use_QE=True, use_affine=False,
-                                                              use_context=True, condition='GaussianMixtureModel', quant_mode='RUN')
+                                                              use_context=True, condition='GaussianMixtureModel', quant_mode='noise')
 
         if self.args.MENet == 'PWC':
             self.MENet = PWCNet(trainable=False)
         elif self.args.MENet == 'SPy':
             self.MENet = SPyNet(trainable=False)
 
-        self.MWNet = SDCNet_3M(sequence_length=3) # Motion warping network
+        self.MWNet = MotionExtrapolationNet(sequence_length=3) # Motion extrapolation network
         self.MWNet.__delattr__('flownet')
 
         self.Motion = mo_coder
@@ -758,7 +757,7 @@ class Pframe(CompressesModel):
                 transforms.ToTensor()
             ])
 
-            self.train_dataset = VimeoDataset(os.path.join(self.args.dataset_path, "vimeo_septuplet/"), qp, 7, transform=transformer)
+            self.train_dataset = VimeoDataset(os.path.join(self.args.dataset_path, "vimeo_septuplet/"), 7, transform=transformer)
             self.val_dataset = VideoTestData(os.path.join(self.args.dataset_path, "video_dataset/"), self.args.lmda, sequence=('B'), GOP=32)
 
         elif stage == 'test':
@@ -858,31 +857,22 @@ if __name__ == '__main__':
         ANFIC_code = {2048: '0821_0300', 1024: '0530_1212', 512: '0530_1213', 256: '0530_1215'}[args.lmda]
 
     torch.backends.cudnn.deterministic = True
- 
-    # Set conv/deconv type ; Signal or Standard
-    conv_type = "Standard" if args.disable_signalconv else trc.SignalConv2d
-    deconv_type = "Transpose" if args.disable_signalconv and args.deconv_type != "Signal" else args.deconv_type
-    trc.set_default_conv(conv_type=conv_type, deconv_type=deconv_type)
-    
-    # Config coders
+  
+    # Config codecs
     assert not (args.motion_coder_conf is None)
     mo_coder_cfg = yaml.safe_load(open(args.motion_coder_conf, 'r'))
-    assert mo_coder_cfg['model_architecture'] in trc.__CODER_TYPES__.keys()
-    mo_coder_arch = trc.__CODER_TYPES__[mo_coder_cfg['model_architecture']]
+    mo_coder_arch = __CODER_TYPES__[mo_coder_cfg['model_architecture']]
     mo_coder = mo_coder_arch(**mo_coder_cfg['model_params'])
  
     assert not (args.cond_motion_coder_conf is None)
     cond_mo_coder_cfg = yaml.safe_load(open(args.cond_motion_coder_conf, 'r'))
-    assert cond_mo_coder_cfg['model_architecture'] in trc.__CODER_TYPES__.keys()
-    cond_mo_coder_arch = trc.__CODER_TYPES__[cond_mo_coder_cfg['model_architecture']]
+    cond_mo_coder_arch = __CODER_TYPES__[cond_mo_coder_cfg['model_architecture']]
     cond_mo_coder = cond_mo_coder_arch(**cond_mo_coder_cfg['model_params'])
 
     assert not (args.residual_coder_conf is None)
     res_coder_cfg = yaml.safe_load(open(args.residual_coder_conf, 'r'))
-    assert res_coder_cfg['model_architecture'] in trc.__CODER_TYPES__.keys()
-    res_coder_arch = trc.__CODER_TYPES__[res_coder_cfg['model_architecture']]
+    res_coder_arch = __CODER_TYPES__[res_coder_cfg['model_architecture']]
     res_coder = res_coder_arch(**res_coder_cfg['model_params'])
-
 
     checkpoint_callback = ModelCheckpoint(
         save_top_k=-1,
