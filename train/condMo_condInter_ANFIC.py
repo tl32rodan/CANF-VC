@@ -758,10 +758,10 @@ class Pframe(CompressesModel):
             ])
 
             self.train_dataset = VimeoDataset(os.path.join(self.args.dataset_path, "vimeo_septuplet/"), qp, 7, transform=transformer)
-            self.val_dataset = VideoTestData(dataset_root, self.args.lmda, sequence=('B'), GOP=32)
+            self.val_dataset = VideoTestData(os.path.join(self.args.dataset_path, "video_dataset/"), self.args.lmda, sequence=('B'), GOP=32)
 
         elif stage == 'test':
-            self.test_dataset = VideoTestData(dataset_root, self.args.lmda, sequence=('U', 'B', 'M', 'K'), GOP=self.args.test_GOP)
+            self.test_dataset = VideoTestData(os.path.join(self.args.dataset_path, "video_dataset/"), self.args.lmda, sequence=('U', 'B', 'M', 'K'), GOP=self.args.test_GOP)
 
         else:
             raise NotImplementedError
@@ -811,6 +811,7 @@ class Pframe(CompressesModel):
         parser.add_argument('--num_workers', default=16, type=int)
         parser.add_argument('--dataset_path', default='./video_dataset', type=str)
         parser.add_argument('--log_path', default='./logs', type=str)
+        parser.add_argument('--save_dir')
 
         return parser
 
@@ -908,7 +909,7 @@ if __name__ == '__main__':
     )
     
     # args.save_dir will be created only when testing
-    args.save_dir = os.path.join(args.logs, project_name, experiment_name + '-' + str(args.lmda))
+    args.save_dir = os.path.join(args.log_path, project_name, experiment_name + '-' + str(args.lmda))
     
     ######## Restore usage:
     #   *(default) 'none': Train P-frame codec from scratch. 
@@ -929,7 +930,7 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=args.logs,
+                                             default_root_dir=args.log_path,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=-1,
                                              terminate_on_nan=True)
@@ -938,7 +939,7 @@ if __name__ == '__main__':
         if args.restore_exp_key is None:
             raise ValueError
         else:  # When prev_exp_key is specified in args
-            checkpoint = torch.load(os.path.join(args.logs, project_name, args.restore_exp_key, "checkpoints", f"epoch={epoch_num}.ckpt"),
+            checkpoint = torch.load(os.path.join(args.log_path, project_name, args.restore_exp_key, "checkpoints", f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
         
         if args.restore == 'resume':
@@ -946,7 +947,7 @@ if __name__ == '__main__':
         else:
             trainer.current_epoch = phase['trainAll_2frames']
         
-        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.log_path, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         for k, v in coder_ckpt.items():
@@ -962,7 +963,7 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=args.logs,
+                                             default_root_dir=args.log_path,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=-1,
                                              terminate_on_nan=True)
@@ -971,13 +972,13 @@ if __name__ == '__main__':
         if args.restore_exp_key is None:
             raise ValueError
         else:  # When prev_exp_key is specified in args
-            checkpoint = torch.load(os.path.join(args.logs, project_name, args.restore_exp_key, "checkpoints",
+            checkpoint = torch.load(os.path.join(args.log_path, project_name, args.restore_exp_key, "checkpoints",
                                                  f"epoch={epoch_num}.ckpt"),
                                     map_location=(lambda storage, loc: storage))
 
         trainer.current_epoch = epoch_num + 1
 
-        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.log_path, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         for k, v in coder_ckpt.items():
@@ -994,18 +995,18 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=args.logs,
+                                             default_root_dir=args.log_path,
                                              check_val_every_n_epoch=1,
                                              num_sanity_val_steps=-1,
                                              terminate_on_nan=True)
         
         epoch_num = args.restore_exp_epoch
 
-        checkpoint = torch.load(os.path.join(args.logs, "ANF-based-resCoder-for-DVC", "cf8be0b8102c4a6eb2015b58f184f757", "checkpoints", "epoch=83.ckpt"),
+        checkpoint = torch.load(os.path.join(args.log_path, "ANF-based-resCoder-for-DVC", "cf8be0b8102c4a6eb2015b58f184f757", "checkpoints", "epoch=83.ckpt"),
                                 map_location=(lambda storage, loc: storage))
         trainer.current_epoch = phase['trainMV']
    
-        gridnet_ckpt = torch.load(os.path.join(args.logs, "CANFVC_Plus", "gridnet.pth"),
+        gridnet_ckpt = torch.load(os.path.join(args.log_path, "CANFVC_Plus", "gridnet.pth"),
                                 map_location=(lambda storage, loc: storage))
         from collections import OrderedDict
         new_ckpt = OrderedDict()
@@ -1013,15 +1014,8 @@ if __name__ == '__main__':
         for k, v in checkpoint['state_dict'].items():
             if k.split('.')[0] != 'MCNet' and k.split('.')[0] != 'MENet':
                 new_ckpt[k] = v
-        for k, v in gridnet_ckpt.items():
-            if k.split('.')[2] == 'backbone':
-                key = '.'.join(['FeatNet'] + k.split('.')[3:])
-                new_ckpt[key] = v
-            elif k.split('.')[2] == 'synth' and k.split('.')[3] != 'heads':
-                key = '.'.join(['MCNet'] + k.split('.')[3:])
-                new_ckpt[key] = v
 
-        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.log_path, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         for k, v in coder_ckpt.items():
@@ -1037,12 +1031,12 @@ if __name__ == '__main__':
                                              gpus=args.gpus,
                                              distributed_backend=db,
                                              logger=comet_logger,
-                                             default_root_dir=args.logs,
+                                             default_root_dir=args.log_path,
                                              check_val_every_n_epoch=3,
                                              num_sanity_val_steps=-1,
                                              terminate_on_nan=True)
     
-        coder_ckpt = torch.load(os.path.join(args.logs, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
+        coder_ckpt = torch.load(os.path.join(args.log_path, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
                                 map_location=(lambda storage, loc: storage))['coder']
 
         from collections import OrderedDict
