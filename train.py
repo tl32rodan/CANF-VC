@@ -21,7 +21,7 @@ from torchvision.utils import make_grid
 from ptflops import get_model_complexity_info
 
 from dataloader import VimeoDataset, VimeoDatasetBPGIframe, VideoTestData
-from CANF_VC.entropy_models import EntropyBottleneck
+from CANF_VC.entropy_models import EntropyBottleneck, estimate_bpp
 from CANF_VC.networks import __CODER_TYPES__, AugmentedNormalizedFlowHyperPriorCoder
 from CANF_VC.flownets import PWCNet, SPyNet
 from CANF_VC.SDCNet import MotionExtrapolationNet
@@ -31,6 +31,7 @@ from CANF_VC.util.psnr import mse2psnr
 from CANF_VC.util.sampler import Resampler
 from CANF_VC.util.ssim import MS_SSIM
 from CANF_VC.util.vision import PlotFlow, PlotHeatMap, save_image
+from CANF_VC.util.tools import Alignment
 
 plot_flow = PlotFlow().cuda() 
 
@@ -170,23 +171,20 @@ class Pframe(CompressesModel):
         if not predict: # For the first P-frame, put I-frame into frame_buffer
             self.frame_buffer = [ref_frame]
 
-        mc, likelihood_m, m_info = self.motion_forward(ref_frame, coding_frame, predict=predict)
+        mc, likelihood_m, info = self.motion_forward(ref_frame, coding_frame, predict=predict)
 
-        reconstructed, likelihood_r, mc_hat, BDQ = self.Residual(coding_frame, xc=mc_frame, x2_back=mc_frame, temporal_cond=mc_frame)
+        reconstructed, likelihood_r, mc_hat, BDQ = self.Residual(coding_frame, xc=mc, x2_back=mc, temporal_cond=mc)
 
         likelihoods = likelihood_m + likelihood_r
         
-        reconstructed = reconstructed.clamp(0, 1)
-
         # Update buffer
         self.frame_buffer.append(reconstructed)
         if len(self.frame_buffer) == 4:
             self.frame_buffer.pop(0)
             assert len(self.frame_buffer) == 3, str(len(self.frame_buffer))
-
-        return_info = m_info.update({'rec_frame': reconstructed,  'likelihoods': likelihoods, 'mc_hat': mc_hat, 'BDQ': BDQ})
-
-        return return_info
+        
+        info.update({'rec_frame': reconstructed, 'likelihoods': likelihoods, 'mc_hat': mc_hat, 'BDQ': BDQ})
+        return info
     
     def disable_modules(self, modules):
         for module in modules:
@@ -217,7 +215,7 @@ class Pframe(CompressesModel):
 
         if epoch < phase['trainMC']:
             for frame_idx in range(1, 3):
-                ref_frame, coding_frame = batch[: frame_idx-1], batch[:, frame_idx]
+                ref_frame, coding_frame = batch[:, frame_idx-1], batch[:, frame_idx]
 
                 info = self(ref_frame, coding_frame, predict=(frame_idx != 1))
 
@@ -230,7 +228,7 @@ class Pframe(CompressesModel):
                     if self.args.ssim:
                         distortion = (1 - distortion)/64
 
-                rate = trc.estimate_bpp(info['likelihood_m'], input=coding_frame)
+                rate = estimate_bpp(info['likelihood_m'], input=coding_frame)
                 
                 if frame_idx == 1:
                     loss += self.args.lmda * distortion.mean() + rate.mean()
@@ -240,15 +238,15 @@ class Pframe(CompressesModel):
                     if self.args.ssim:
                         pred_frame_error = (1 - pred_frame_error)/64
                     loss += self.args.lmda * distortion.mean() + rate.mean() + 0.01 * self.args.lmda * pred_frame_error.mean()
+                    pred_frame_error_list.append(pred_frame_error.mean())
 
                 # Manually update buffer
                 self.frame_buffer[-1] = coding_frame
 
                 dist_list.append(distortion.mean())
                 rate_list.append(rate.mean())
-                pred_frame_error_list.append(pred_frame_error.mean())
 
-            loss = loss / frame_count
+            loss = loss / frame_idx
             distortion = torch.mean(torch.tensor(dist_list))
             rate = torch.mean(torch.tensor(rate_list))
             pred_frame_error = torch.mean(torch.tensor(pred_frame_error_list))
@@ -270,7 +268,7 @@ class Pframe(CompressesModel):
                 info = self(ref_frame, coding_frame, predict=(frame_idx != 1))
 
                 distortion = self.criterion(coding_frame, info['rec_frame'])
-                rate = trc.estimate_bpp(info['likelihoods'], input=coding_frame)
+                rate = estimate_bpp(info['likelihoods'], input=coding_frame)
 
                 if self.args.ssim:
                     distortion = (1 - distortion)/64
@@ -351,7 +349,7 @@ class Pframe(CompressesModel):
         rate_list = []
         m_rate_list = []
         loss_list = []
-        align = trc.util.Alignment()
+        align = Alignment()
 
         epoch = int(self.current_epoch)
 
@@ -363,15 +361,14 @@ class Pframe(CompressesModel):
                 coding_frame = batch[:, frame_idx]
 
                 info = self(align.align(ref_frame), align.align(coding_frame), predict=(frame_idx != 1))
-
                 likelihoods, likelihood_m = info['likelihoods'], info['likelihood_m']
                 rec_frame = align.resume(info['rec_frame']).clamp(0, 1)
                 mc_frame = align.resume(info['mc_frame']).clamp(0, 1)
                 mc_hat = align.resume(info['mc_hat']).clamp(0, 1)
                 BDQ = align.resume(info['BDQ']).clamp(0, 1)
 
-                rate = trc.estimate_bpp(likelihoods, input=ref_frame).mean().item()
-                m_rate = trc.estimate_bpp(likelihood_m, input=ref_frame).mean().item()
+                rate = estimate_bpp(likelihoods, input=ref_frame).mean().item()
+                m_rate = estimate_bpp(likelihood_m, input=ref_frame).mean().item()
 
                 if frame_idx <= 2:
                     mse = torch.mean((rec_frame - coding_frame).pow(2))
@@ -380,17 +377,17 @@ class Pframe(CompressesModel):
                     mc_psnr = get_psnr(mc_mse).cpu().item()
 
                     if frame_idx == 2:
-                        flow_hat = align.resume(data['pred_flow'])
+                        flow_hat = align.resume(info['pred_flow'])
                         flow_rgb = torch.from_numpy(
                             fz.convert_from_flow(flow_hat[0].permute(1, 2, 0).cpu().numpy()) / 255).permute(2, 0, 1)
                         upload_img(flow_rgb.cpu().numpy(), f'{seq_name}_{epoch}_pred_flow.png', grid=False)
                     
-                        flow_hat = align.resume(data['pred_flow_hat'])
+                        flow_hat = align.resume(info['pred_flow_hat'])
                         flow_rgb = torch.from_numpy(
                             fz.convert_from_flow(flow_hat[0].permute(1, 2, 0).cpu().numpy()) / 255).permute(2, 0, 1)
                         upload_img(flow_rgb.cpu().numpy(), f'{seq_name}_{epoch}_pred_flow_hat.png', grid=False)
 
-                    flow_hat = align.resume(data['flow_hat'])
+                    flow_hat = align.resume(info['flow_hat'])
                     flow_rgb = torch.from_numpy(
                         fz.convert_from_flow(flow_hat[0].permute(1, 2, 0).cpu().numpy()) / 255).permute(2, 0, 1)
                     upload_img(flow_rgb.cpu().numpy(), f'{seq_name}_{epoch}_dec_flow_{frame_idx}.png', grid=False)
@@ -413,10 +410,10 @@ class Pframe(CompressesModel):
 
             else:
                 with torch.no_grad():
-                    rec_frame, likelihoods, _, _, _, _ = self.if_model(align.align(batch[:, frame_idx]))
+                    rec_frame, likelihoods, _ = self.if_model(align.align(batch[:, frame_idx]))
 
                 rec_frame = align.resume(rec_frame).clamp(0, 1)
-                rate = trc.estimate_bpp(likelihoods, input=rec_frame).mean().item()
+                rate = estimate_bpp(likelihoods, input=rec_frame).mean().item()
 
                 mse = self.criterion(rec_frame, batch[:, frame_idx]).mean().item()
                 psnr = mse2psnr(mse)
@@ -514,7 +511,7 @@ class Pframe(CompressesModel):
         log_list = []
 
         # To align frame into multiplications of 64 ; zero-padding is performed
-        align = Alignment().to(DEVICE)
+        align = Alignment()
         
         # Clear motion buffer & frame buffer
         self.MWNet.clear_buffer()
@@ -522,7 +519,7 @@ class Pframe(CompressesModel):
 
         for frame_idx in range(gop_size):
             ref_frame = ref_frame.clamp(0, 1)
-            coding_frame = batch[:, frame_idx].to(DEVICE)
+            coding_frame = batch[:, frame_idx]
 
             # P-frame
             if frame_idx != 0:
@@ -536,8 +533,8 @@ class Pframe(CompressesModel):
                 mc_hat = align.resume(info['mc_hat']).clamp(0, 1)
                 BDQ = align.resume(info['BDQ']).clamp(0, 1)
 
-                rate = trc.estimate_bpp(likelihoods, input=ref_frame).mean().item()
-                m_rate = trc.estimate_bpp(likelihood_m, input=ref_frame).mean().item()
+                rate = estimate_bpp(likelihoods, input=ref_frame).mean().item()
+                m_rate = estimate_bpp(likelihood_m, input=ref_frame).mean().item()
 
                 mse = self.criterion(rec_frame, coding_frame).mean().item()
                 if self.args.msssim:
@@ -555,17 +552,17 @@ class Pframe(CompressesModel):
 
                 
                 if TO_VISUALIZE:
-                    flow_map = plot_flow(data['flow_hat'])
+                    flow_map = plot_flow(info['flow_hat'])
                     save_image(flow_map,os.path.join(self.args.save_dir, f'{seq_name}/flow/', f'frame_{int(frame_id_start + frame_idx)}_flow.png'), nrow=1)
 
                     if frame_idx > 1:
-                        flow_map = plot_flow(data['pred_flow'])
+                        flow_map = plot_flow(info['pred_flow'])
                         save_image(flow_map, os.path.join(self.args.save_dir, f'{seq_name}/flow/', f'frame_{int(frame_id_start + frame_idx)}_flow_pred.png'), nrow=1)
 
-                        flow_map = plot_flow(data['pred_flow_hat'])
+                        flow_map = plot_flow(info['pred_flow_hat'])
                         save_image(flow_map, os.path.join(self.args.save_dir, f'{seq_name}/flow/', f'frame_{int(frame_id_start + frame_idx)}_flow_pred_hat.png'), nrow=1)
 
-                        pred_frame = align.resume(data['pred_frame'])
+                        pred_frame = align.resume(info['pred_frame'])
                         save_image(pred_frame, os.path.join(self.args.save_dir, f'{seq_name}/pred_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
 
                     save_image(coding_frame[0], os.path.join(self.args.save_dir, f'{seq_name}/gt_frame/', f'frame_{int(frame_id_start + frame_idx)}.png'), nrow=1)
@@ -605,7 +602,7 @@ class Pframe(CompressesModel):
             # I-frame
             else:
                 rec_frame, likelihoods, _ = self.if_model(align.align(coding_frame))
-                rec_frame = align.resume(rec_frame.to(DEVICE)).clamp(0, 1)
+                rec_frame = align.resume(rec_frame).clamp(0, 1)
                 rate = estimate_bpp(likelihoods, input=rec_frame).mean().item()
 
                 if self.args.msssim:
@@ -1024,7 +1021,7 @@ if __name__ == '__main__':
                                              logger=comet_logger,
                                              default_root_dir=args.log_path,
                                              check_val_every_n_epoch=3,
-                                             num_sanity_val_steps=-1,
+                                             num_sanity_val_steps=0,
                                              terminate_on_nan=True)
     
         coder_ckpt = torch.load(os.path.join(args.log_path, f"ANFIC/ANFHyperPriorCoder_{ANFIC_code}/model.ckpt"),
