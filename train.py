@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import sys
+import time
 
 from functools import partial
 from torchinfo import summary
@@ -35,13 +36,14 @@ from CANF_VC.util.tools import Alignment
 
 plot_flow = PlotFlow().cuda() 
 
-phase = {'trainMV': 15, 
-         'trainMC': 25, 
-         'trainRes_2frames': 27, 
-         'trainAll_2frames': 29, 
-         'trainAll_fullgop': 35, 
-         'trainAll_RNN_1': 36, 
-         'trainAll_RNN_2': 39,
+phase = {'trainMV': 10, 
+         'trainMC': 15, 
+         'trainRes_2frames': 18, 
+         'trainRes_2frames': 23, 
+         'trainAll_2frames': 25, 
+         'trainAll_fullgop': 30, 
+         'trainAll_RNN_1': 33, 
+         'trainAll_RNN_2': 35,
          'train_aux': 100}
 
 
@@ -85,7 +87,7 @@ class Pframe(CompressesModel):
         self.criterion = nn.MSELoss(reduction='none') if not self.args.ssim else MS_SSIM(data_range=1.).cuda()
 
         self.if_model = AugmentedNormalizedFlowHyperPriorCoder(128, 320, 192, num_layers=2, use_QE=True, use_affine=False,
-                                                              use_context=True, condition='GaussianMixtureModel', quant_mode='noise')
+                                                               use_context=True, condition='GaussianMixtureModel', quant_mode='noise')
 
         if self.args.MENet == 'PWC':
             self.MENet = PWCNet(trainable=False)
@@ -139,10 +141,16 @@ class Pframe(CompressesModel):
             else:
                 frame_buffer = [self.frame_buffer[0], self.frame_buffer[0], self.frame_buffer[1]]
 
+            start = time.time()
             pred_frame, pred_flow = self.MWNet(frame_buffer, None, True)
+            print('MW=', time.time() - start)
 
+            start = time.time()
             flow = self.MENet(ref_frame, coding_frame)
+            print('ME=', time.time() - start)
+            start = time.time()
             flow_hat, likelihood_m, pred_flow_hat, _ = self.CondMotion(flow, xc=pred_flow, x2_back=pred_flow, temporal_cond=pred_frame)
+            print('motion coding=', time.time() - start)
 
             self.MWNet.append_flow(flow_hat)
             
@@ -204,7 +212,7 @@ class Pframe(CompressesModel):
         self.requires_grad_(True)
         if epoch < phase['trainMC']:
             self.disable_modules([self.MENet, self.MWNet])
-        elif epoch < phase['trainRes_2frames']:
+        elif epoch < phase['trainRes_fullgop']:
             self.disable_modules([self.MENet, self.MWNet, self.Motion, self.CondMotion, self.MCNet])
         
         #### Start training with a batch of sequences ####
@@ -283,7 +291,7 @@ class Pframe(CompressesModel):
                 rate_list.append(rate.mean())
                 mc_error_list.append(mc_error.mean())
 
-                if epoch < phase['trainAll_2frames'] and frame_idx == 2:
+                if (epoch < phase['trainRes_2frames'] or (epoch >= phase['trainRes_fullgop'] and epoch < phase['trainAll_2frames'])) and frame_idx == 2:
                     break
 
             loss = loss / frame_idx
@@ -756,10 +764,8 @@ class Pframe(CompressesModel):
 
             self.train_dataset = VimeoDataset(os.path.join(self.args.dataset_path, "vimeo_septuplet/"), 7, transform=transformer)
             self.val_dataset = VideoTestData(os.path.join(self.args.dataset_path, "video_dataset/"), self.args.lmda, sequence=('B'), GOP=32)
-
         elif stage == 'test':
             self.test_dataset = VideoTestData(os.path.join(self.args.dataset_path, "video_dataset/"), self.args.lmda, sequence=('U', 'B', 'M', 'K'), GOP=self.args.test_GOP)
-
         else:
             raise NotImplementedError
 
