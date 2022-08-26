@@ -16,7 +16,6 @@ from PIL import Image
 
 libbpg_path = os.getenv('BPG') # Put your libbpg path here
 
-
 class VimeoDataset(torchData):
     """ vimeo_septuplet dataset
         download: `$ wget http://data.csail.mit.edu/tofu/dataset/vimeo_septuplet.zip`

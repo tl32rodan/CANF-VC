@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import sys
-import time
 
 from functools import partial
 from torchinfo import summary
@@ -38,13 +37,13 @@ plot_flow = PlotFlow().cuda()
 
 phase = {'trainMV': 10, 
          'trainMC': 15, 
-         'trainRes_2frames': 18, 
          'trainRes_2frames': 23, 
-         'trainAll_2frames': 25, 
-         'trainAll_fullgop': 30, 
-         'trainAll_RNN_1': 33, 
-         'trainAll_RNN_2': 35,
-         'train_aux': 100}
+         'trainAll_2frames': 28, 
+         'trainAll_fullgop': 33, 
+         'trainAll_fullgop_1': 38, 
+         #'trainAll_RNN_1': 35, 
+         #'trainAll_RNN_2': 40,
+         'train_aux': 40}
 
 
 class CompressesModel(LightningModule):
@@ -141,16 +140,10 @@ class Pframe(CompressesModel):
             else:
                 frame_buffer = [self.frame_buffer[0], self.frame_buffer[0], self.frame_buffer[1]]
 
-            start = time.time()
             pred_frame, pred_flow = self.MWNet(frame_buffer, None, True)
-            print('MW=', time.time() - start)
 
-            start = time.time()
             flow = self.MENet(ref_frame, coding_frame)
-            print('ME=', time.time() - start)
-            start = time.time()
             flow_hat, likelihood_m, pred_flow_hat, _ = self.CondMotion(flow, xc=pred_flow, x2_back=pred_flow, temporal_cond=pred_frame)
-            print('motion coding=', time.time() - start)
 
             self.MWNet.append_flow(flow_hat)
             
@@ -725,7 +718,7 @@ class Pframe(CompressesModel):
         # Learning rate degrades when RNN-based training
         lr_step = []
         for k, v in phase.items():
-            if 'RNN' in k and v > current_epoch: 
+            if ('RNN' in k or 'fullgop' in k) and v > current_epoch: 
                 lr_step.append(v-current_epoch)
         lr_gamma = 0.5
         print('lr decay =', lr_gamma, 'lr milestones =', lr_step)
@@ -894,9 +887,9 @@ if __name__ == '__main__':
         db = 'ddp'
 
     comet_logger = CometLogger(
-        api_key="bFaTNhLcuqjt1mavz02XPVwN8",
+        api_key="", # Fill with your own
         project_name=project_name,
-        workspace="tl32rodan",
+        workspace="", # Fill with your own
         experiment_name=experiment_name + "-" + str(args.lmda),
         experiment_key = args.restore_exp_key if args.restore == 'resume' else None,
         disabled=args.test or args.debug
